@@ -1,0 +1,32 @@
+# ---------- 依赖与构建产物 ----------
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+
+# ---------- 本地数据与备份（体积大、含真实经营数据，不入库）----------
+ingest/data/
+ingest/logs/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3.bak*
+*.db
+
+# ---------- 运行期日志与失败记录 ----------
+*.log
+
+# ---------- 第三方参考源码（自带独立 .git，不属于本仓库）----------
+03-ivyeaops-src/
+
+# ---------- macOS / 编辑器 ----------
+.DS_Store
+.vscode/
+.idea/
+
+# ---------- 本地环境变量与密钥 ----------
+.env
+.env.*
+!.env.example

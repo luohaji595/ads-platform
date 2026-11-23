@@ -1,0 +1,501 @@
+"""
+归因回填
+
+一次运行做三件事：
+  1. 找出「已经点了『已改』、归因窗也到期、但还没回看」的决定
+  2. 拿执行前 N 天 vs 执行后 N 天的真实数据算清变化，**同时给出同期全店的对照**
+  3. 把结果写进 decision_log 的 outcome_7d_json / outcome_14d_json，填 outcome_filled_at
+
+它不做的事：
+  - 不说「这是我改好的」。执行前后对比不是 A/B 测试 —— 同期账户整体也在变
+    （旺季、流量、竞品），所以每条结果里都带一列全店同期对照，让人自己看。
+  - 不在样本不够的时候给结论。后窗口点击不到判定线就写 insufficient，
+    宁可写「还看不出来」，也不把噪声说成效果。
+  - 不改建议、不改状态、不动广告后台。只填空。
+
+用法：
+    python3 attribute.py               # 正常跑，回填到期的
+    python3 attribute.py --dry-run     # 只打印会写什么，不写库
+    python3 attribute.py --now 2026-11-27T07:00:00+08:00   # 假装那天跑（验算用）
+    python3 attribute.py --decision 153                    # 只处理这一条
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from datetime import date, datetime, timedelta, timezone
+
+import facts
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB = os.path.join(HERE, "..", "ingest", "data", "ads.sqlite3")
+
+CST = timezone(timedelta(hours=8))
+
+# 判「有变化」的带宽。**这是工程默认，不是统计结论** ——
+# 单对象前后对比的噪声很大，低于 15% 的变化不值得当成信号。
+RELEVANCE_BAND = 0.15
+
+# 后窗口点击少于此数，任何方向都不谈（连 CVR 都算不稳）。
+MIN_AFTER_CLICKS = 20
+
+# 终局窗口：7 天到期先回看一次，14 天再补一次。
+FINAL_WINDOW_DAYS = 14
+
+
+# ---------------------------------------------------------------- 时间与账本
+
+def _parse_ts(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(ts, fmt)
+            return dt if dt.tzinfo else dt.replace(tzinfo=CST)
+        except ValueError:
+            continue
+    return None
+
+
+def _d(day: str) -> date:
+    return date.fromisoformat(day)
+
+
+def _window(start: date, end: date) -> tuple[str, str, int]:
+    """闭区间窗口。end < start 时返回 0 天。"""
+    days = (end - start).days + 1
+    return start.isoformat(), end.isoformat(), max(0, days)
+
+
+def due_rows(conn: sqlite3.Connection, now: datetime) -> list[sqlite3.Row]:
+    """到期待回填：状态是 executed、归因窗已过、7 天结果还没填。"""
+    return conn.execute(
+        """select decision_id, run_id, rule_id, entity_type, entity_id, entity_label,
+                  market_id, campaign_id, action_type, current_value, proposed_value,
+                  executed_value, executed_at, attribution_due_at, confidence,
+                  spend_impact, outcome_7d_json, outcome_14d_json, outcome_filled_at
+           from decision_log
+           where status = 'executed'
+             and outcome_filled_at is null
+             and attribution_due_at is not null
+             and outcome_7d_json is null
+           order by attribution_due_at"""
+    ).fetchall()
+
+
+def second_pass_rows(conn: sqlite3.Connection, now: datetime) -> list[sqlite3.Row]:
+    """7 天已回填、14 天还没到终局的：到期后再补一次长窗口。"""
+    return conn.execute(
+        """select decision_id, run_id, rule_id, entity_type, entity_id, entity_label,
+                  market_id, campaign_id, action_type, current_value, proposed_value,
+                  executed_value, executed_at, attribution_due_at, confidence,
+                  spend_impact, outcome_7d_json, outcome_14d_json, outcome_filled_at
+           from decision_log
+           where status = 'executed'
+             and outcome_filled_at is null
+             and outcome_7d_json is not null
+             and outcome_14d_json is null
+             and executed_at is not null
+           order by executed_at"""
+    ).fetchall()
+
+
+# ---------------------------------------------------------------- 取数
+
+_METRIC_COLS = ("sum(clicks) clicks, sum(impressions) impressions, "
+                "sum(cost) cost, sum(ads_sales) sales, sum(ads_orders) orders")
+
+# entity_type → 事实表。表里没有的对象就不该出现在决策里，出现也算没数据。
+_ENTITY_TABLE = {
+    "keyword": ("fact_keyword_daily", "keyword_id"),
+    "search_term": ("fact_search_term_daily", "search_term"),
+    "campaign": ("fact_campaign_daily", "campaign_id"),
+    "placement": ("fact_placement_daily", "placement"),
+}
+
+
+def _entity_table(d: sqlite3.Row) -> tuple[str, str] | None:
+    return _ENTITY_TABLE.get((d["entity_type"] or "").lower())
+
+
+def _entity_stats(conn: sqlite3.Connection, d: sqlite3.Row,
+                  start: str, end: str) -> dict:
+    """按 entity_type 选表。找不到对象就当没数据，不猜。"""
+    spec = _entity_table(d)
+    if spec is None:
+        return {"rows": 0, "unsupported_entity_type": d["entity_type"]}
+    table, key = spec
+    sql = (f"select count(distinct report_date) rows, {_METRIC_COLS} "
+           f"from {table} where {key} = ? and report_date between ? and ?")
+    try:
+        r = conn.execute(sql, (d["entity_id"], start, end)).fetchone()
+    except sqlite3.Error as exc:  # 表/列不在（老库）
+        return {"rows": 0, "error": str(exc)}
+    if r is None or (r["clicks"] is None and r["cost"] is None
+                     and r["impressions"] is None):
+        return {"rows": 0}
+    return _derive({k: r[k] for k in r.keys() if k != "rows"},
+                   start, end, rows=r["rows"])
+
+
+def _account_stats(conn: sqlite3.Connection, market_id, start: str, end: str) -> dict:
+    """同期全店：对照组。执行前后账户整体在变，不扣掉这层就会把趋势算成自己的功劳。"""
+    try:
+        if market_id is None:
+            r = conn.execute(
+                f"select count(distinct report_date) rows, {_METRIC_COLS} "
+                "from fact_campaign_daily where report_date between ? and ?",
+                (start, end)).fetchone()
+        else:
+            r = conn.execute(
+                f"select count(distinct report_date) rows, {_METRIC_COLS} "
+                "from fact_campaign_daily where market_id = ? and report_date between ? and ?",
+                (market_id, start, end)).fetchone()
+    except sqlite3.Error as exc:
+        return {"rows": 0, "error": str(exc)}
+    if r is None or not r["rows"]:
+        return {"rows": 0}
+    return _derive({k: r[k] for k in r.keys() if k != "rows"}, start, end,
+                   rows=r["rows"])
+
+
+def _ratio(num, den):
+    if num is None or den in (None, 0):
+        return None
+    return round(num / den, 4)
+
+
+def _derive(raw: dict, start: str, end: str, rows: int | None = None) -> dict:
+    clicks = raw.get("clicks")
+    orders = raw.get("orders")
+    cost = raw.get("cost")
+    sales = raw.get("sales")
+    impressions = raw.get("impressions")
+    out = {
+        "start": start,
+        "end": end,
+        "days": (_d(end) - _d(start)).days + 1,
+        "clicks": clicks or 0,
+        "impressions": impressions or 0,
+        "orders": orders or 0,
+        "cost": round(cost, 2) if cost is not None else None,
+        "sales": round(sales, 2) if sales is not None else None,
+        "cvr": _ratio(orders, clicks),
+        "cpc": _ratio(cost, clicks),
+        "cpo": _ratio(cost, orders),      # 每单成本：这条最像「这笔钱花得值不值」
+        "acos": _ratio(cost, sales),
+    }
+    if rows is not None:
+        out["data_days"] = rows
+    return out
+
+
+# ---------------------------------------------------------------- 判定
+
+def _pct_delta(before, after):
+    if before in (None, 0) or after is None:
+        return None
+    return round((after - before) / before, 4)
+
+
+def _verdict(before: dict, after: dict, acct_b: dict, acct_a: dict) -> tuple[str, str]:
+    """返回 (verdict, basis)。宁可 insufficient，不把噪声说成效果。
+
+    顺序有讲究：先看数据到没到，再看样本够不够，最后才谈方向。
+    零单的那一段（最常见）不给「每单成本」，因为除以 0 没有意义 —— 改比花费，
+    同样扣掉同期全店的变化。
+    """
+    if not after.get("clicks") and not after.get("cost"):
+        return "no_data", "执行后这段窗口还没有数据 —— 报表还没到，等下一天。"
+
+    if (after.get("days") or 0) <= 0:
+        return "no_data", "执行后窗口长度为 0，没有可比的数据。"
+
+    acct_cost = _pct_delta(acct_b.get("cost"), acct_a.get("cost"))
+    acct_cpo = _pct_delta(acct_b.get("cpo"), acct_a.get("cpo"))
+
+    # ---- 执行后零单：每单成本无意义，比花费 ----
+    if not after.get("orders"):
+        cost_b, cost_a = before.get("cost") or 0.0, after.get("cost") or 0.0
+        if cost_b <= 0 and cost_a <= 0:
+            return "insufficient", "执行前后都没有花费，没有可比的东西。"
+        ent = _pct_delta(cost_b, cost_a)
+        rel = round((ent if ent is not None else -1.0) - (acct_cost or 0.0), 4)
+        word = "相对少花" if rel < 0 else "相对多花"
+        if acct_cost is None:
+            line = f"执行后零单：花 {cost_a:.2f}（前 {cost_b:.2f}）；全店同期无对照"
+        else:
+            line = (f"执行后零单：花 {cost_a:.2f}（前 {cost_b:.2f}"
+                    f"{'' if ent is None else f'，{ent:+.0%}'}）；"
+                    f"全店同期花费 {acct_cost:+.0%}，"
+                    f"{word} {abs(rel):.0%}")
+        if before.get("orders") and not after.get("orders"):
+            # 零单是不是「改坏了」，取决于同期本来就该出几单。
+            # 用全店同期的 CVR 当参照：期望单数不到 1，零单就在噪声里。
+            exp = (after.get("clicks") or 0) * (acct_a.get("cvr") or 0.0)
+            line += f"；{before['orders']} 单 → 0 单"
+            if acct_cpo and acct_cpo > 0:
+                line += f"（全店每单成本同期 {acct_cpo:+.0%}）"
+            if exp < 1.0:
+                return ("insufficient",
+                        line + f"。按全店同期 CVR，这 {after.get('clicks') or 0} 击"
+                        f"本来也只该出 {exp:.2f} 单，零单在噪声内，判不出是谁的错。")
+            return ("worsened",
+                    line + f"。按全店同期 CVR 这 {after.get('clicks') or 0} 击"
+                    f"该出 {exp:.2f} 单，零单超出了噪声。")
+        if rel <= -RELEVANCE_BAND:
+            return "improved", line + " → 同样零单，但相对少花了钱。"
+        if rel >= RELEVANCE_BAND:
+            return "worsened", line + " → 同样零单，还相对多花了钱。"
+        return "flat", line + " → 落在带宽内。"
+
+    if (after.get("clicks") or 0) < MIN_AFTER_CLICKS:
+        return ("insufficient",
+                f"执行后只有 {after.get('clicks') or 0} 次点击，"
+                f"少于 {MIN_AFTER_CLICKS}，这个量级连 CVR 都不稳，不谈效果。")
+
+    # ---- 前后都出单：比每单成本，扣掉全店 ----
+    cpo_b, cpo_a = before.get("cpo"), after.get("cpo")
+    if cpo_b and cpo_a:
+        ent = _pct_delta(cpo_b, cpo_a)
+        rel = round(ent - (acct_cpo or 0.0), 4)
+        basis = (f"每单成本 {cpo_b:.2f} → {cpo_a:.2f}（{ent:+.0%}），"
+                 f"全店同期 {acct_cpo:+.0%}；扣掉全店那层后相对变化 {rel:+.0%}，"
+                 f"带宽 ±{RELEVANCE_BAND:.0%}")
+        if rel <= -RELEVANCE_BAND:
+            return "improved", basis + " → 相对全店确实变好。"
+        if rel >= RELEVANCE_BAND:
+            return "worsened", basis + " → 相对全店确实变差。"
+        return "flat", basis + " → 落在带宽内，看不出方向。"
+
+    # ---- 执行前零单、执行后出单 ----
+    if before.get("orders") in (0, None):
+        return ("improved",
+                f"执行前零单（{before.get('clicks') or 0} 击），"
+                f"执行后出 {after['orders']} 单、花 {after.get('cost') or 0:.2f}；"
+                f"全店每单成本同期 {acct_cpo:+.0%}"
+                if acct_cpo is not None else
+                f"执行前零单，执行后出 {after['orders']} 单。")
+
+    return "insufficient", "前后都出了单但每单成本算不出来，样本不足。"
+
+
+# ---------------------------------------------------------------- 回填
+
+def _windows(d: sqlite3.Row, long: bool) -> tuple[int, dict] | None:
+    """按账本自己的 executed→due 天数推窗口，不另建一张映射表。"""
+    ex = _parse_ts(d["executed_at"])
+    due = _parse_ts(d["attribution_due_at"])
+    if not ex:
+        return None
+    if long:
+        n = FINAL_WINDOW_DAYS
+    elif due:
+        n = max(1, (due.date() - ex.date()).days)
+    else:
+        n = 7
+    exd = ex.date()
+    if long:
+        before_start, before_end = exd - timedelta(days=n), exd - timedelta(days=1)
+        after_start, after_end = exd, exd + timedelta(days=n - 1)
+    else:
+        before_start, before_end = exd - timedelta(days=n), exd - timedelta(days=1)
+        after_start, after_end = exd, due.date() - timedelta(days=1)
+    bs, be, bdays = _window(before_start, before_end)
+    as_, ae, adays = _window(after_start, after_end)
+    return n, {"n": n, "before": (bs, be, bdays), "after": (as_, ae, adays)}
+
+
+def _data_through(conn: sqlite3.Connection) -> str | None:
+    r = conn.execute("select max(report_date) d from fact_campaign_daily").fetchone()
+    return r["d"] if r and r["d"] else None
+
+
+def build_outcome(conn: sqlite3.Connection, d: sqlite3.Row,
+                  now: datetime, long: bool = False) -> dict | None:
+    win = _windows(d, long)
+    if not win:
+        return None
+    n, w = win
+    bs, be, bdays = w["before"]
+    as_, ae, adays = w["after"]
+
+    before = _entity_stats(conn, d, bs, be)
+    after = _entity_stats(conn, d, as_, ae)
+    acct_b = _account_stats(conn, d["market_id"], bs, be)
+    acct_a = _account_stats(conn, d["market_id"], as_, ae)
+
+    verdict, basis = _verdict(before, after, acct_b, acct_a)
+
+    # 数据只到哪天：写进结果，免得人拿「报表还没到」当成「没效果」
+    through = _data_through(conn)
+    covered_days = None
+    if through:
+        last = min(_d(through), _d(ae))
+        if _d(as_) <= last:
+            covered_days = (last - _d(as_)).days + 1
+
+    return {
+        "window_days": n,
+        "executed_at": d["executed_at"],
+        "executed_value": d["executed_value"],
+        "action_type": d["action_type"],
+        "entity": {"type": d["entity_type"], "id": d["entity_id"],
+                   "label": d["entity_label"]},
+        "before": before,
+        "after": after,
+        "account": {"before": acct_b, "after": acct_a,
+                    "note": "同期全店，用来扣掉「整个账户都在变」那部分"},
+        "relative": {
+            "cpo": _pct_delta(before.get("cpo"), after.get("cpo")),
+            "cvr": _pct_delta(before.get("cvr"), after.get("cvr")),
+            "cost": _pct_delta(before.get("cost"), after.get("cost")),
+            "clicks": _pct_delta(before.get("clicks"), after.get("clicks")),
+        },
+        "verdict": verdict,
+        "basis": basis,
+        "data_through": through,
+        "after_covered_days": covered_days,
+        "caveat": ("执行前后对比，不是 A/B 测试：同期账户整体也在变（旺季、流量、"
+                   "竞品动作），所以每条都给了全店同期对照。看的是「相对全店」那一列，"
+                   "不是绝对数字。"),
+        "filled_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _reason_hit(conn: sqlite3.Connection, d: sqlite3.Row, payload: dict,
+                now: datetime) -> None:
+    """归因结论也进原因账本，将来复盘这个词时能看到「当时回看过，结论是什么」。"""
+    try:
+        conn.execute(
+            """insert into reason_hit (object_id, reason_code, scope, evidence_text,
+                                       created_at, answer_type, decision_id)
+               values (?, ?, ?, ?, ?, 'attribution', ?)""",
+            (str(d["entity_id"]), f"outcome_{payload['window_days']}d",
+             d["rule_id"],
+             f"{payload['verdict']}：{payload['basis']}"[:500],
+             now.isoformat(timespec="seconds"), d["decision_id"]))
+    except sqlite3.Error:
+        pass  # reason_hit 是旁证，写不进去不该挡住回填
+
+
+def fill_one(conn: sqlite3.Connection, d: sqlite3.Row,
+             now: datetime, long: bool = False) -> dict:
+    payload = build_outcome(conn, d, now, long=long)
+    if payload is None:
+        return {"decision_id": d["decision_id"], "skipped": "executed_at 缺失或不可解析"}
+
+    col = "outcome_14d_json" if long else "outcome_7d_json"
+    sets = [f"{col} = ?"]
+    params: list = [json.dumps(payload, ensure_ascii=False)]
+
+    # 什么时候算「终局」：14 天窗口已回看，或这条本来就只有 7 天（不补长窗）
+    mark_done = long or payload["window_days"] >= FINAL_WINDOW_DAYS
+    if mark_done:
+        sets.append("outcome_filled_at = ?")
+        params.append(now.isoformat(timespec="seconds"))
+
+    # 7 天那次顺带把 14 天的占位写上，页面上能看出「还要再看一次」
+    if not long and payload["window_days"] < FINAL_WINDOW_DAYS and not d["outcome_14d_json"]:
+        sets.append("outcome_14d_json = ?")
+        params.append(json.dumps({
+            "pending": True,
+            "window_days": FINAL_WINDOW_DAYS,
+            "note": f"14 天终局要等到执行后第 {FINAL_WINDOW_DAYS} 天再看一次。",
+        }, ensure_ascii=False))
+
+    params.append(d["decision_id"])
+    conn.execute(f"update decision_log set {', '.join(sets)} where decision_id = ?",
+                 params)
+    _reason_hit(conn, d, payload, now)
+    return {"decision_id": d["decision_id"], "verdict": payload["verdict"],
+            "window_days": payload["window_days"], "basis": payload["basis"],
+            "done": mark_done}
+
+
+def run(db: str = DB, now: datetime | None = None, dry_run: bool = False,
+        only: int | None = None, verbose: bool = True) -> dict:
+    now = now or datetime.now(CST)
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        todo = [r for r in due_rows(conn, now)
+                if (only is None or r["decision_id"] == only)
+                and r["attribution_due_at"] and _parse_ts(r["attribution_due_at"])
+                and _parse_ts(r["attribution_due_at"]) <= now]
+        todo_long = [r for r in second_pass_rows(conn, now)
+                     if (only is None or r["decision_id"] == only)
+                     and _parse_ts(r["executed_at"])
+                     and _parse_ts(r["executed_at"]).date() + timedelta(days=FINAL_WINDOW_DAYS)
+                     <= now.date()]
+
+        results = []
+        for r in todo:
+            if dry_run:
+                p = build_outcome(conn, r, now, long=False)
+                results.append({"decision_id": r["decision_id"], "dry_run": True,
+                                "outcome": p})
+                continue
+            results.append(fill_one(conn, r, now, long=False))
+            if verbose:
+                last = results[-1]
+                say(f"[归因] #{last['decision_id']} {last.get('verdict')}"
+                    f"（{last.get('window_days')} 天）：{last.get('basis')}")
+
+        for r in todo_long:
+            if dry_run:
+                p = build_outcome(conn, r, now, long=True)
+                results.append({"decision_id": r["decision_id"], "dry_run": True,
+                                "outcome_14d": p})
+                continue
+            results.append(fill_one(conn, r, now, long=True))
+
+        if not dry_run:
+            conn.commit()
+
+        stat = {"due": len(todo), "second_pass": len(todo_long),
+                "results": results, "now": now.isoformat(timespec="seconds"),
+                "dry_run": dry_run}
+        if verbose:
+            say(f"[归因] 到期 {len(todo)} 条，14 天补看 {len(todo_long)} 条"
+                + ("（dry-run，未写库）" if dry_run else ""))
+            if not todo and not todo_long:
+                say("[归因] 没有到期的 —— 归因窗还没走完，这是正常的。")
+        return stat
+    finally:
+        conn.close()
+
+
+def say(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="归因回填：到期后拿真实数据回看一遍")
+    ap.add_argument("--db", default=DB)
+    ap.add_argument("--now", default=None, help="假装现在是这个时间（ISO 带时区）")
+    ap.add_argument("--decision", type=int, default=None, help="只处理这一条")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args(argv)
+
+    now = None
+    if args.now:
+        now = _parse_ts(args.now)
+        if now is None:
+            say(f"时间读不懂：{args.now}")
+            return 2
+
+    if not os.path.exists(args.db):
+        say(f"库不在：{args.db}")
+        return 2
+
+    run(db=args.db, now=now, dry_run=args.dry_run, only=args.decision)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

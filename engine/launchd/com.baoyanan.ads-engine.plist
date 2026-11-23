@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baoyanan.ads-engine</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/Frameworks/Python.framework/Versions/3.13/bin/python3</string>
+    <string>/Users/baoyanan/自动化广告平台/engine/run.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/baoyanan/自动化广告平台/engine</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <!-- ingest 每天 06:10 起跑，实测跑完约 06:48；engine 排在 07:00，确保数据已落库 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>7</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/baoyanan/Library/Logs/ads-engine.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/baoyanan/Library/Logs/ads-engine.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

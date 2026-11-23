@@ -1,0 +1,11 @@
+      eval_id = 74
+ agent_run_id = 21
+        agent = diagnose
+        claim = 11-16 的点击数在 T+3 重拉后 ≥ T+1 首次读数的 1.2 倍
+verifiable_at = 2026-11-19
+       method = 对比 fact 或 ingest 日志里 11-16 的 clicks 在 T+1 与 T+3 两次读数
+     expected = T+3 clicks ≥ 1.2 × T+1 clicks
+      verdict = unverifiable
+       actual = 该断言需要对比 11-16 clicks 在 T+1（11-17）与 T+3（11-19）两次读数，但事实包只给出账户 11-01~11-18 的聚合数据（clicks 5779），既无按天的 clicks 明细，更无两次快照的历史读数；且数据覆盖止于 11-18，早于 T+3 读数日 11-19，无法计算 T+3 clicks ≥ 1.2 × T+1 clicks。
+   checked_at = 2026-11-19T12:28:23+08:00
+   created_at = 2026-11-18T10:34:30+08:00

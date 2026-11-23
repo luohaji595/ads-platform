@@ -1,0 +1,25 @@
+{
+  "window_start": "2026-10-31",
+  "window_end": "2026-11-13",
+  "run_id": null,
+  "front": [],
+  "questions": [
+    {
+      "id": "Q08",
+      "object": "账户目标",
+      "ask": "窗口转化率 0.63%，达不到目标 ACOS 30.00% 所需的 1.46%。降出价只能少花钱，不能把转化率抬上去。今天怎么处理这个目标？",
+      "options": [
+        "先维持 30%，下面降价建议只用来控损",
+        "把目标 ACOS 放宽，重新算一遍建议",
+        "先不动出价，去查主图 / 价格 / 落地页",
+        "其他（请补一句依据）"
+      ]
+    }
+  ],
+  "conflict_count": 3,
+  "overflow_count": 0,
+  "below_count": 3,
+  "saved": 0,
+  "spent": 0,
+  "target_reachable": false
+}
