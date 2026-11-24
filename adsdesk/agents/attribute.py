@@ -88,9 +88,11 @@ PROMPT_VER = "attribute-v1"                 # 判据版本，跟代码一起改
 #   预算改动当天就影响投放量；bid 要等下一次竞价生效；否词要等归因回传；
 #   收割/暂停要等长尾跑完。窗口短了 = 在效应还没显现时判「无效」。
 ATTRIBUTION_DAYS = {
-    "lower_budget": 3,      # 降预算：当天见效，但要看 3 天才够判定线
-    "reduce_budget": 3,     # 同义的旧写法，留着防止历史行匹配不到
-    "raise_budget": 3,
+    # 预算改动当天就改变投放量，但报表按天汇总、归因还要回传：3 天里有一天的
+    # 数据是半截的，判「有没有效」太早。5 天是「够判 + 不过度拖延」的折中。
+    "lower_budget": 5,      # 降预算
+    "reduce_budget": 5,     # 同义的旧写法，留着防止历史行匹配不到
+    "raise_budget": 5,
     "reduce_bid": 7,        # 调 bid 要等竞价与归因回传
     "raise_bid": 7,
     "adjust_placement": 7,  # 位置溢价
@@ -114,6 +116,11 @@ MIN_AFTER_CLICKS = 20
 # 终局窗口：7 天到期先回看一次，14 天再补一次。
 FINAL_WINDOW_DAYS = 14        # 终局窗口：执行后第 14 天回看
 GRACE_DAYS = 7                # 窗结束后再等 7 天；仍无数据就按「确实没数据」结案
+
+# 结算缓冲：窗末日之后还要等报表把这几天的归因回传跑完。
+# 没有这道缓冲时，窗一到就算账，窗末最后 1~2 天的订单还没回传 →
+# 后窗口订单被系统性低估 → ACOS 虚高 → 判成 worsened → record.py 去踩刹车。
+ATTR_SETTLE_LAG_DAYS = 3
 
 # 对照组：同规则、同层级、±7 天内未改动，最多取 5 条（§8.4 的 SQL 原样）。
 CONTROL_WINDOW_DAYS = 7
@@ -396,15 +403,29 @@ def peers(conn: sqlite3.Connection, d: sqlite3.Row) -> list[dict]:
         return []
     try:
         rows = conn.execute(
-            """select decision_id, entity_type, entity_id, entity_label, status,
-                      decided_at, action_type
-                 from decision_log
-                where rule_id = ? and entity_type = ? and decision_id != ?
-                  and substr(decided_at, 1, 10) between date(?, ?) and date(?, ?)
-                  and status in ('expired', 'rejected')
-                order by decided_at desc
+            """select cand.decision_id, cand.entity_type, cand.entity_id,
+                      cand.entity_label, cand.status, cand.decided_at, cand.action_type
+                 from decision_log cand
+                where cand.rule_id = ? and cand.entity_type = ? and cand.decision_id != ?
+                  and substr(cand.decided_at, 1, 10)
+                      between date(?, ?) and date(?, ?)
+                  and cand.status in ('expired', 'rejected')
+                  -- 同一个对象在这段时间里如果另有一条已执行决策，它就不再是
+                  -- 「没动过」的对照组：它的变化可能来自那次改动。原实现没排，
+                  -- 于是「别的动作造成的变化」被当成趋势扣掉，或者反过来把
+                  -- 真实效应当趋势抹平。
+                  and not exists (
+                      select 1 from decision_log x
+                       where x.entity_type = cand.entity_type
+                         and x.entity_id = cand.entity_id
+                         and x.status = 'executed'
+                         and substr(coalesce(x.executed_at, x.decided_at), 1, 10)
+                             between date(?, ?) and date(?, ?))
+                order by cand.decided_at desc
                 limit ?""",
             (d["rule_id"], d["entity_type"], d["decision_id"],
+             anchor, f"-{CONTROL_WINDOW_DAYS} days",
+             anchor, f"+{CONTROL_WINDOW_DAYS} days",
              anchor, f"-{CONTROL_WINDOW_DAYS} days",
              anchor, f"+{CONTROL_WINDOW_DAYS} days",
              CONTROL_PEER_LIMIT),
@@ -415,13 +436,18 @@ def peers(conn: sqlite3.Connection, d: sqlite3.Row) -> list[dict]:
 
 
 def _peer_window(peer: dict, n: int) -> tuple[tuple[str, str, int], tuple[str, str, int]] | None:
-    """对照组的时间窗：以 decided_at 为锚，长度与本次归因窗一致。"""
+    """对照组的时间窗：以 decided_at 为锚，长度与本次归因窗一致。
+
+    锚点当天同样排除在 after 之外 —— 对照组虽然「没改动」，但它的 decided_at
+    当天也处在同一批数据里；把它算进 after 会让对照组的后窗口比实验组多一天，
+    两边长度名义相同、实际不同。
+    """
     anchor = _parse_ts(peer.get("decided_at"))
     if not anchor:
         return None
     a = anchor.date()
     return (_window(a - timedelta(days=n), a - timedelta(days=1)),
-            _window(a, a + timedelta(days=n - 1)))
+            _window(a + timedelta(days=1), a + timedelta(days=n)))
 
 
 def _sum_stats(items: list[dict]) -> dict:
@@ -594,23 +620,52 @@ def _windows(d: sqlite3.Row, long: bool) -> tuple[int, dict] | None:
     due_at 是那次写库时算出来的，窗口从它反推，天然一致。
     """
     ex = _parse_ts(d["executed_at"])
-    due = _parse_ts(d["attribution_due_at"])
     if not ex:
         return None
-    if long:
-        n = FINAL_WINDOW_DAYS
-    elif due:
-        n = max(1, (due.date() - ex.date()).days)
-    else:
-        n = days_for(d["action_type"])
+    n = FINAL_WINDOW_DAYS if long else _window_days_for(d)
+    if n <= 0:
+        return None
     exd = ex.date()
-    if long or not due:
-        before = _window(exd - timedelta(days=n), exd - timedelta(days=1))
-        after = _window(exd, exd + timedelta(days=n - 1))
-    else:
-        before = _window(exd - timedelta(days=n), exd - timedelta(days=1))
-        after = _window(exd, due.date() - timedelta(days=1))
+    before = _window(exd - timedelta(days=n), exd - timedelta(days=1))
+    # after 从「次日」起算，不再含执行当天。改动通常发生在盘中（#153 是 09:25），
+    # 当天数据混着改动前的时段：把它算进「执行后」，等于让 1/n 的脏数据去评价
+    # 效果 —— 3 天窗时这一天占 33%，7 天窗占 14%。
+    after = _window(exd + timedelta(days=1), exd + timedelta(days=n))
     return n, {"n": n, "before": before, "after": after}
+
+
+def _window_days_for(d: sqlite3.Row) -> int:
+    """这条决策该看几天：优先账本里的 due_at，其次动作类型默认。"""
+    ex = _parse_ts(d["executed_at"])
+    if not ex:
+        return 0
+    due = _parse_ts(d["attribution_due_at"])
+    if due:
+        return max(1, (due.date() - ex.date()).days)
+    return days_for(d["action_type"])
+
+
+def _window_matured(ex: datetime | None, window_days: int,
+                    through: date | None, now: datetime) -> bool:
+    """能不能结算：窗满 + 过了回传缓冲 + 报表覆盖到窗末，三条缺一不可。
+
+    原实现只判第一条（窗满），于是窗一到就拿当时的半截数据算账：窗末最后
+    1~2 天的订单还没回传 → 后窗口订单被系统性低估 → ACOS 虚高 → 判成
+    worsened → record.py 据此降配额。错的是结算时点，不是数据本身。
+    """
+    if not ex or window_days <= 0:
+        return False
+    last_day = ex.date() + timedelta(days=window_days)   # after 从次日起算，第 n 天
+    settle_day = last_day + timedelta(days=ATTR_SETTLE_LAG_DAYS)
+    if now.date() < settle_day:
+        return False
+    if through is None:
+        return False
+    if through >= settle_day:
+        return True
+    # 报表迟到或已停投：宽限期过了、且至少覆盖到窗末，就按「确实没数据」结案，
+    # 不然这条决策会永远挂在 due 里，把后面所有行一起堵住。
+    return now.date() >= last_day + timedelta(days=GRACE_DAYS) and through >= last_day
 
 
 def _predicts(d: sqlite3.Row, payload: dict, now: datetime) -> list[dict]:
@@ -908,26 +963,25 @@ def run(db: str = DB, now: datetime | None = None, dry_run: bool = False,
         if not dry_run:
             _reap_stale(conn)
 
-        todo = [r for r in due_rows(conn, now)
-                if (only is None or r["decision_id"] == only)
-                and _parse_ts(r["attribution_due_at"])
-                and _parse_ts(r["attribution_due_at"]) <= now]
-
-        # 14 天终局这两道门缺一不可：窗到期（时间），且报表覆盖到窗末日（数据）。
-        # 只判前者的话，报表迟到那天会算出一片空白，然后被当成终局永久写进库。
+        # 报表覆盖到哪天：时间门与数据门都要它，先算出来。
         _through_raw = _data_through(conn)
         through = _d(_through_raw) if _through_raw else None
 
+        # 到期只是「该看了」，不是「可以结算」：还要过了回传缓冲、且报表覆盖
+        # 到窗末。原来这里只比 attribution_due_at <= now，窗一到就算账。
+        todo = [r for r in due_rows(conn, now)
+                if (only is None or r["decision_id"] == only)
+                and _parse_ts(r["attribution_due_at"])
+                and _parse_ts(r["attribution_due_at"]) <= now
+                and _window_matured(_parse_ts(r["executed_at"]),
+                                    _window_days_for(r), through, now)]
+
+        # 14 天终局这两道门缺一不可：窗到期（时间），且报表覆盖到窗末 + 回传缓冲
+        # （数据）。只判前者的话，报表迟到那天会算出一片空白，然后被当成终局
+        # 永久写进库。
         def _long_ready(r: sqlite3.Row) -> bool:
-            ex = _parse_ts(r["executed_at"])
-            if not ex:
-                return False
-            last_day = ex.date() + timedelta(days=FINAL_WINDOW_DAYS - 1)
-            if last_day > now.date():
-                return False
-            if through is None:
-                return False
-            return through >= last_day
+            return _window_matured(_parse_ts(r["executed_at"]),
+                                   FINAL_WINDOW_DAYS, through, now)
 
         todo_long = [r for r in second_pass_rows(conn, now)
                      if (only is None or r["decision_id"] == only)

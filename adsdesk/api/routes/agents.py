@@ -215,12 +215,24 @@ def runs(limit: int = Query(20, ge=1, le=200)):
 def objections(
     limit: int = Query(20, ge=1, le=200),
     outcome: Literal["all", "pending", "correct", "wrong", "unverifiable"] = "all",
+    sort: Literal["recent", "due"] = "recent",
 ):
-    """反对与兑现。summary 按全表算（不是按本页），否则「共 N 条」会随 limit 变。"""
+    """反对与兑现。summary 按全表算（不是按本页），否则「共 N 条」会随 limit 变。
+
+    sort='due' 按兑现日从近到远排，没写兑现日的排最后 —— 前端「按到期日」那一栏用它。
+    为什么不让前端自己排：表里 35 条反对有 26 条 verifiable_at 是空的，
+    前端只能就着已返回的 20 条排，最近到期的那几条可能根本没进来。
+    """
     where, params = "", []
     if outcome != "all":
         where = "where outcome = ?"
         params.append(outcome)
+    # null 排最后：sqlite 里 null 排序会跑到最前，那样「最近到期」第一屏全是没日期的。
+    order = (
+        "order by (verifiable_at is null or verifiable_at = ''), verifiable_at asc, objection_id desc"
+        if sort == "due"
+        else "order by objection_id desc"
+    )
     try:
         with read_conn() as conn:
             rows = conn.execute(
@@ -228,7 +240,7 @@ def objections(
                            created_at, outcome, predicts_json, verifiable_at,
                            actual, judged_by
                     from agent_objection {where}
-                    order by objection_id desc
+                    {order}
                     limit ?""",
                 (*params, limit),
             ).fetchall()

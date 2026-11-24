@@ -2,6 +2,17 @@
 
 const BASE = '/api'
 
+/**
+ * 前端期望的后端接口版本，必须与 adsdesk/api/main.py 的 API_VERSION 一致。
+ * 不一致时顶栏会红字提示：这个项目只有一个人改，最容易的失败不是写错逻辑，
+ * 而是「改了接口没重启」或「改了前端没 build」，然后对着一个空白页面猜半天。
+ */
+export const EXPECT_API = 3
+
+export type Health = { ok: boolean; api_version?: number; db: string; db_exists: boolean }
+
+export const getHealth = () => get<Health>('/health')
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(BASE + path, {
     headers: { 'Content-Type': 'application/json' },
@@ -30,7 +41,16 @@ export type Freshness = {
   stale_any: boolean
   last_run: { run_id: number; status: string; decisions: number; suppressed: number; window_start: string; window_end: string } | null
   last_memorial: { run_id: number; business_day: string; bytes: number; agent_state: string } | null
-  counts: { proposed: number; approved: number; executed: number }
+  /** pending_policy / open_objection 是后加的（老后端不带，所以可选）：
+   *  前者是归因 agent 攒出来、等人点一下才生效的策略条数；
+   *  后者是 agent 提了反对、但还没到兑现判定日的条数。 */
+  counts: {
+    proposed: number
+    approved: number
+    executed: number
+    pending_policy?: number
+    open_objection?: number
+  }
 }
 
 /** 该活动最紧的那档位次（ratio 最大的一天一个位次） */
@@ -599,12 +619,17 @@ export const getAgentSummary = () => get<AgentSummary>('/agents/summary')
 export const getAgentRuns = (limit = 20) =>
   get<{ runs: AgentRunRow[]; note: string | null }>(`/agents/runs?limit=${limit}`)
 
-export const getAgentObjections = (limit = 20, outcome: AgentOutcomeFilter = 'all') =>
+/** sort='due' 按兑现日从近到远（没写日期的排最后），'recent' 按记录倒序。 */
+export const getAgentObjections = (
+  limit = 20,
+  outcome: AgentOutcomeFilter = 'all',
+  sort: 'recent' | 'due' = 'recent',
+) =>
   get<{
     objections: AgentObjectionRow[]
     summary: AgentObjectionSummary | null
     note: string | null
-  }>(`/agents/objections?limit=${limit}&outcome=${outcome}`)
+  }>(`/agents/objections?limit=${limit}&outcome=${outcome}&sort=${sort}`)
 
 export const getAgentEvals = (limit = 30, verdict: AgentVerdictFilter = 'all') =>
   get<{
@@ -616,3 +641,46 @@ export const getAgentEvals = (limit = 30, verdict: AgentVerdictFilter = 'all') =
 
 export const getAgentAssumptions = () =>
   get<{ assumptions: AgentAssumptionRow[]; note: string | null }>('/agents/assumptions')
+
+
+// ───────────────────────────── 策略库（认领） ─────────────────────────────
+// 归因 agent 只写 proposed；人在这里点一下才变 active，engine 下次跑就按它行事。
+// 这是整个工作台除了审批之外**唯一**会改变系统未来行为的写动作。
+
+export type PolicyRow = {
+  policy_id: number
+  scope: string
+  object_id: string
+  policy_type: string
+  /** 人话短语，如「该对象降价后 7/14 天实测有效 → 下次同类信号直接降」 */
+  type_label: string
+  evidence_text: string | null
+  /** 形如 `归因agent#123-14d-2026-11-24`，是这条结论的出生证明 */
+  source: string
+  /** 从 source/params 里抠出来的来源决策，用于回看当时那条建议 */
+  decision_id: number | null
+  params: Record<string, unknown>
+  status: string
+  created_at: string
+  reviewed_at: string | null
+  expires_at: string | null
+}
+
+export type PolicyList = { policies: PolicyRow[]; note: string | null }
+
+export const getPolicyPending = () => get<PolicyList>('/policy/pending')
+export const getPolicyActive = () => get<PolicyList>('/policy/active')
+
+/** 认领：proposed → active。note 会追加进 evidence_text，记下「当时凭什么」。 */
+export const activatePolicy = (policyId: number, note?: string) =>
+  post<{ ok: boolean; detail: { policy_id: number; status: string; noop: boolean; reviewed_at: string | null } }>(
+    `/policy/${policyId}/activate`,
+    { actor: 'owner', note: note || null },
+  )
+
+/** 驳回：proposed → rejected。留下 reviewed_at，说明「人看过、没认」。 */
+export const rejectPolicy = (policyId: number, reason?: string) =>
+  post<{ ok: boolean; detail: { policy_id: number; status: string; noop: boolean; reviewed_at: string | null } }>(
+    `/policy/${policyId}/reject`,
+    { actor: 'owner', reason: reason || null },
+  )

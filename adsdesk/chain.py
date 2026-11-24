@@ -25,6 +25,15 @@
     python3 adsdesk/chain.py --force         # 忽略时间窗，立刻跑
     python3 adsdesk/chain.py --status        # 只看状态，不动手
     python3 adsdesk/chain.py --only ingest engine
+
+关于 midship（2026-11-24 补）：
+    `midship` 已接进本文件（MAX_ATTEMPTS / TIMEOUTS / build_cmd / step_done 都有
+    它的分支），可以用 `--only midship` 或 `--only ingest ... converge midship`
+    显式排进来，但它**不在默认七步里**。原因是它的输入是事件账本 events.db，
+    账本由各 agent 的 hooks 在运行时投递；整条链跑完之前当天账本还没闭合，
+    先投影等于把半截事件推给 gbrain。而且 midship 失败会让整链 blocked，
+    代价远大于晚一天投影。想每天都跑，就在调度器里再挂一个「链跑完后」的
+    独立 job，别塞进这条顺序链。
 """
 
 from __future__ import annotations
@@ -49,12 +58,15 @@ LOCK_PATH = "/tmp/ads-chain.lock"
 WINDOW_START_HOUR = 9
 WINDOW_END_HOUR = 23
 # 每步每天最多试几次（失败才计数；ok 之后当天不再跑）
+# midship 记在这里，才能用 `--only midship` 手动触发（argparse 的 choices 就是
+# 这份字典）。它默认不在日更链里，原因见 main() 里 steps 那段注释。
 MAX_ATTEMPTS = {"ingest": 8, "market": 3, "rank": 4, "engine": 4, "diagnose": 2,
-                "attribute": 2, "converge": 2}
+                "attribute": 2, "converge": 2, "midship": 2}
 # 每步超时（秒）：ingest 有 60s/次的接口节流，补 7 天要上百次调用
 # market 是 sorftime 逐词 keyword_detail（默认 30 个词）+ 竞品快照，给 20 分钟够用
 TIMEOUTS = {"ingest": 180 * 60, "market": 20 * 60, "rank": 15 * 60, "engine": 30 * 60,
-            "diagnose": 30 * 60, "attribute": 20 * 60, "converge": 20 * 60}
+            "diagnose": 30 * 60, "attribute": 20 * 60, "converge": 20 * 60,
+            "midship": 10 * 60}
 # R31 加价的闸是 rank_snapshot 观测不超过 6 小时（engine/facts.py 的
 # RANK_SNAPSHOT_MAX_AGE_HOURS）。这里不重复那个判定 —— 数据老不老由引擎的闸
 # 负责（它会正确地停手），采集步只负责「今天问过了」。两处都判会让守夜人
@@ -207,6 +219,20 @@ def step_done(conn: sqlite3.Connection, step: str, today: str) -> tuple[bool, st
         age = f"，最新观测 {obs['m']}（{(datetime.now() - last).total_seconds() / 3600.0:.1f}h 前）" if last else ""
         return True, f"今天已轮询 {row['c']} 次{age}"
 
+    if step == "midship":
+        # 判定的是「今天有没有成功投影过」，读 run_log（真实状态），不读 chain_run。
+        # 踩过的坑（2026-11-24 18:00）：一开始读 chain_run，但 run_step 是
+        # 「跑完 → 复验 → 才 record」，所以第一次成功也必判 failed —— 链会一直
+        # 重试到 MAX_ATTEMPTS 然后报红。现在由 midship 自己在退出前写 run_log
+        # （dataset='midship.project'），和 rank/market 一个路子。
+        row = conn.execute(
+            "select count(*) c, max(substr(coalesce(finished_at, started_at),12,8)) t "
+            "from run_log where status='ok' and dataset like 'midship%' "
+            "and substr(coalesce(finished_at, started_at),1,10)=?", (today,)).fetchone()
+        if not row["c"]:
+            return False, "今天还没有成功的事件中台投影"
+        return True, f"今天已投影 {row['c']} 次（最近 {row['t'] or '—'}）"
+
     fresh = freshness(conn, today)
     if step == "engine":
         row = conn.execute(
@@ -319,6 +345,10 @@ def build_cmd(step: str, model: str) -> list[str]:
         return [PY, str(ROOT / "adsdesk" / "agents" / "attribute.py")]
     if step == "converge":
         return [PY, str(ROOT / "adsdesk" / "agents" / "converge.py"), "--model", model]
+    if step == "midship":
+        # 事件中台投影：把当天的事件账本推进 gbrain。--project 是投影模式
+        # （--project-only 只投影不消费，留给人工排查用）。
+        return [PY, "-m", "midship", "--project"]
     raise KeyError(step)
 
 
@@ -406,6 +436,11 @@ def main(argv: list[str]) -> int:
     today = date.today().isoformat()
     # rank 排在 market 之后、engine 之前：engine 的 R31 卡位规则要读 rank_snapshot，
     # 排在 engine 后面等于让引擎读昨天的位次。
+    #
+    # midship 是 opt-in：它的输入是事件账本（events.db），而账本由各 agent 的
+    # hooks 在运行时投递；整条链跑完之前，当天的账本还没闭合，先投影只会把半截
+    # 事件推给 gbrain，且失败会触发整链 blocked。需要时手动 `--only midship`
+    # 或在收敛之后再接一段，别塞进这条顺序链里。
     steps = args.only or ["ingest", "market", "rank", "engine", "diagnose",
                           "attribute", "converge"]
 

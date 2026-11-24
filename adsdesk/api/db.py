@@ -69,11 +69,17 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
     if not DB_PATH.exists():
         raise FileNotFoundError(f"库不存在：{DB_PATH}")
     if readonly:
+        # mode=ro + query_only：只读句柄既不许写，也不许改连接级状态。
+        # 之前这里无条件执行 journal_mode=WAL —— 在只读句柄上那是写操作，
+        # 库若还没转成 WAL（新拷贝、备份、`cp` 出来的副本），直接抛
+        # sqlite3.OperationalError: attempt to write a readonly database。
+        # 已经 是 WAL 的库只是回读模式，所以这个坑平时不显形、换机器才炸。
         conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        conn.execute("pragma query_only=ON")
     else:
         conn = sqlite3.connect(DB_PATH)
+        conn.execute("pragma journal_mode=WAL")
     conn.row_factory = sqlite3.Row
-    conn.execute("pragma journal_mode=WAL")
     conn.execute("pragma busy_timeout=5000")
     return conn
 

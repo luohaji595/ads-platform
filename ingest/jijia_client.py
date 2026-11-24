@@ -20,6 +20,12 @@ from typing import Any
 BASE_URL = os.environ.get("JIJIA_BASE_URL", "https://open.gerpgo.com/api/open")
 KEYCHAIN_ACCOUNT = os.environ.get("JIJIA_KEYCHAIN_ACCOUNT", os.environ.get("USER", ""))
 MIN_INTERVAL = float(os.environ.get("JIJIA_MIN_INTERVAL", "60"))
+# 重试间隔单独一条：token 过期重试若复用 60s 主节流，一次过期就阻塞一分钟。
+# 日更链有 600s 网关硬截止，批量补数时连续命中会直接把 ingest 拖超时。
+RETRY_INTERVAL = float(os.environ.get("JIJIA_RETRY_INTERVAL", "5"))
+# 积加「token 失效」的业务码。HTTP 仍是 200，错误藏在 body 里 ——
+# 只看 HTTP 状态码的话这两个永远抓不到。
+TOKEN_EXPIRED_CODES = {401, 40005, "401", "40005"}
 TIMEOUT = int(os.environ.get("JIJIA_TIMEOUT", "90"))
 
 
@@ -87,25 +93,49 @@ class JijiaClient:
         self._token_expires_at = time.time() + max(60, expires_in - 60)
         return token
 
-    def _throttle(self) -> None:
-        if MIN_INTERVAL <= 0:
+    def _throttle(self, interval: float | None = None) -> None:
+        """调用间隔闸。interval 缺省走 60s 主节流；重试走短间隔。"""
+        wait_for = MIN_INTERVAL if interval is None else interval
+        if wait_for <= 0:
             return
-        wait = MIN_INTERVAL - (time.time() - self._last_call_at)
+        wait = wait_for - (time.time() - self._last_call_at)
         if wait > 0:
             time.sleep(wait)
+
+    @staticmethod
+    def _is_token_expired_resp(resp: dict[str, Any]) -> bool:
+        """HTTP 200 但业务码说 token 过期 —— 积加最常见的过期形态。
+
+        不能只看 code：有些接口把错误塞在 msg 里，所以两条都认。
+        """
+        if not isinstance(resp, dict):
+            return False
+        if resp.get("code") in TOKEN_EXPIRED_CODES:
+            return True
+        msg = str(resp.get("msg") or "").lower()
+        return "40005" in msg or ("token" in msg and ("过期" in msg or "expire" in msg))
 
     def call(self, endpoint: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         _, app_key = self._credentials()
         self._throttle()
         try:
-            return self._call_once(endpoint, payload, app_key)
+            resp = self._call_once(endpoint, payload, app_key)
         except RuntimeError as error:
             text = str(error)
             if "401" not in text and "40005" not in text:
                 raise
             self._token = ""
+            self._throttle(RETRY_INTERVAL)
             return self._call_once(endpoint, payload, app_key)
+        # 业务层过期：HTTP 200、code=401/40005。原实现没有这条分支，
+        # 于是「token 过期」在正常调用路径上是一段永远走不到的死代码 ——
+        # 表现是接口一直回 401，而客户端一次都不肯续 token。
+        if self._is_token_expired_resp(resp):
+            self._token = ""
+            self._throttle(RETRY_INTERVAL)
+            return self._call_once(endpoint, payload, app_key)
+        return resp
 
     def _call_once(self, endpoint: str, payload: dict[str, Any], app_key: str) -> dict[str, Any]:
         token = self._get_token()

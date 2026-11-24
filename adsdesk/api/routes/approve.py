@@ -122,10 +122,16 @@ def _close_exec_items(conn, decision_id: int, ts: str, executed_by: str) -> list
     ]
     if not order_ids:
         return []
+    # order_id 过滤不能省：上面只挑了「未取消单」的 order_ids，但这条 update
+    # 原本按 decision_id 一刀切，已取消单里的同一条目也会被打上 executed_at ——
+    # 作废的单子凭空多出「已改」记录，重算 done/partial 时又只统计 order_ids，
+    # 于是出现「明细有执行时间、单子状态却不动」的对不上账。
+    marks = ",".join("?" * len(order_ids))
     conn.execute(
-        """update exec_order_item set executed_at=?, executed_by=?
-           where decision_id=? and executed_at is null""",
-        (ts, executed_by, decision_id),
+        f"""update exec_order_item set executed_at=?, executed_by=?
+             where decision_id=? and executed_at is null
+               and order_id in ({marks})""",
+        (ts, executed_by, decision_id, *order_ids),
     )
     out = []
     for oid in order_ids:
@@ -145,7 +151,10 @@ def mark_executed(body: ExecutedIn):
     """用户改完后台回来点「已改」。归因窗从这一刻开始算。"""
     with write_conn() as conn:
         d = _fetch_decision(conn, body.decision_id)
-        if d["status"] not in ("approved", "proposed"):
+        # 只认 approved。原先这里放行了 proposed：未审批的建议也能直接标「已改」，
+        # 等于把「主人打钩」这道唯一的人工闸门绕过去了 —— 归因窗照样开算，
+        # 库里出现一条没人批过却已执行的决策。
+        if d["status"] != "approved":
             raise HTTPException(
                 409, f"#{body.decision_id} 当前状态 {d['status']}，只有已批的才能标已改")
         days = body.attribution_days or days_for(d["action_type"])

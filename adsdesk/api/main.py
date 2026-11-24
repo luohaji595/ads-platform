@@ -23,7 +23,21 @@ for _p in (str(ADS_DESK), str(ROOT)):
         sys.path.insert(0, _p)
 
 from api.db import WriteDenied  # noqa: E402
-from api.routes import agents, approve, chat, cockpit, memorial, meta  # noqa: E402
+from api.routes import (  # noqa: E402
+    agents,
+    approve,
+    chat,
+    cockpit,
+    memorial,
+    meta,
+    policy,
+)
+
+# 前端期望的接口版本。前端在 lib/api.ts 里写着同一个数字（EXPECT_API），
+# 两边不等时顶栏直接红字提示 —— 这个工作台是「改前端忘记 build」「重启后端没重载」
+# 都会发生的单人项目，让人对着白屏猜原因是最贵的失败方式。
+# 加/删/改接口返回结构时**必须**同时改这里的数字和前端那个常量。
+API_VERSION = 3
 
 app = FastAPI(
     title="广告工作台",
@@ -57,12 +71,20 @@ app.include_router(approve.router, prefix="/api/approve", tags=["approve"])
 app.include_router(cockpit.router, prefix="/api/cockpit", tags=["cockpit"])
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(agents.router, prefix="/api/agents", tags=["agents"])
+# 策略认领是**写**入口，和 agents 的只读诊断分开挂：
+# 将来要审计「谁让这条规矩生效」时，看这一条前缀就够了。
+app.include_router(policy.router, prefix="/api/policy", tags=["policy"])
 
 
 @app.get("/api/health")
 def health():
     from api.db import DB_PATH
-    return {"ok": True, "db": str(DB_PATH), "db_exists": DB_PATH.exists()}
+    return {
+        "ok": True,
+        "api_version": API_VERSION,
+        "db": str(DB_PATH),
+        "db_exists": DB_PATH.exists(),
+    }
 
 
 # 前端构建产物（npm run build 后落在 adsdesk/web/dist）

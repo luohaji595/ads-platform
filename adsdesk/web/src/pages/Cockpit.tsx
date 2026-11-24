@@ -12,6 +12,19 @@ import RankPanel, { type RankPanelData } from './RankPanel'
 
 const W = 720
 
+/**
+ * 末几天不进判断：报表还在回传归因。
+ * 后端 cockpit.py 的 _days() 已经把最后 2 天排除在窗口外，attribute.py 的
+ * ATTR_SETTLE_LAG_DAYS=3 又是「窗末之后还要等 3 天回传」。两个数不是一回事，
+ * 但前端只需要说清一件事：这几天是半截数据，别当结论看。改后端常量时记得同步这里。
+ */
+const IMMATURE_DAYS = 2
+
+// 并排的两张小图用更窄的 viewBox：等比缩放时 4:1 的比例铺到半屏宽才不会压成一条线。
+// 和 W 一样，这里的数只影响画法，不影响数据。
+const MINI_W = 360
+const MINI_H = 84
+
 function isErr(x: any): x is { error: string } {
   return x && typeof x.error === 'string'
 }
@@ -42,7 +55,7 @@ function rankMove(v: number | null | undefined): string {
   return v > 0 ? `↑${v}` : `↓${Math.abs(v)}`
 }
 
-export default function Cockpit() {
+export default function Cockpit({ signal }: { signal?: number }) {
   const [data, setData] = useState<CockpitSummary | null>(null)
   const [err, setErr] = useState<string | null>(null)
   // 位次单独取：它依赖外部抓取，随时可能是空的，不能拖累首屏那六格。
@@ -58,6 +71,17 @@ export default function Cockpit() {
       .catch(() => setRank(null))
   }, [])
 
+  // 常驻挂载：App 每次轮询到新数据都会把 signal 加一，这里跟着重取一次。
+  useEffect(() => {
+    if (!signal) return
+    get<CockpitSummary>('/cockpit/summary')
+      .then(setData)
+      .catch((e) => setErr(String(e.message || e)))
+    get<RankPanelData>('/cockpit/rank')
+      .then(setRank)
+      .catch(() => setRank(null))
+  }, [signal])
+
   if (err) return <div className="err">打不开驾驶舱：{err}</div>
   if (!data) return <div className="note">读取中…</div>
 
@@ -69,15 +93,63 @@ export default function Cockpit() {
   const a = data.attribution as any
 
   const series = isErr(f) ? [] : f.series || []
+  const dates = series.map((s: any) => s.date)
   const costs = series.map((s: any) => s.cost)
   const acoss = series.map((s: any) => s.acos)
   const cvrs = series.map((s: any) => s.cvr)
+
+  // ROAS = 销售额 / 花费。ACOS 的倒数，但人看的是「一块钱回来几块」，
+  // 换算成本低、解释成本也低，两个都摆着省得心算。
+  const cost = !isErr(f) ? Number(f.totals.cost ?? 0) : 0
+  const sales = !isErr(f) ? Number(f.totals.sales ?? 0) : 0
+  const roas = cost > 0 ? sales / cost : null
 
   const pfMax = isErr(p) ? 1 : Math.max(0.0001, ...(p.portfolios || []).map((x: any) => x.cvr_hi || 0))
   const kwMax = isErr(k) ? 1 : Math.max(0.0001, ...(k.keywords || []).map((x: any) => x.cost || 0))
 
   return (
     <div>
+      {/* 首屏六格：不看图也知道今天花了多少、赚不赚。图给趋势，数字给结论 ——
+          以前要滚到每张卡里各看一个 tag 才拼出全貌。 */}
+      {!isErr(f) && (
+        <div className="kpi-grid" style={{ marginBottom: 12 }}>
+          <div className="kpi">
+            <div className="k-label">花费</div>
+            <div className="k-value">{fmtMoney(f.totals.cost)}</div>
+            <div className="k-extra">{f.window.start} ~ {f.window.end}</div>
+          </div>
+          <div className="kpi">
+            <div className="k-label">销售额</div>
+            <div className="k-value">{fmtMoney(f.totals.sales)}</div>
+            <div className="k-extra">{fmtInt(f.totals.orders)} 单</div>
+          </div>
+          <div className={`kpi ${f.totals.acos != null && f.totals.acos > 0.35 ? 'alert' : ''}`}>
+            <div className="k-label">ACOS</div>
+            <div className="k-value">{fmtPct(f.totals.acos)}</div>
+            <div className="k-extra">{f.totals.acos != null && f.totals.acos > 0.35 ? '高于 35%' : '在目标内'}</div>
+          </div>
+          <div className="kpi">
+            <div className="k-label">ROAS</div>
+            <div className="k-value">{roas == null ? '—' : `${roas.toFixed(2)}×`}</div>
+            <div className="k-extra">每花 1 块回来多少</div>
+          </div>
+          <div className="kpi">
+            <div className="k-label">CVR</div>
+            <div className="k-value">{fmtPct(f.totals.cvr)}</div>
+            <div className="k-extra">{fmtInt(f.totals.clicks)} 击</div>
+          </div>
+          <div className="kpi">
+            <div className="k-label">CPC</div>
+            <div className="k-value">{f.totals.cpc == null ? '—' : `$${Number(f.totals.cpc).toFixed(2)}`}</div>
+            <div className="k-extra">每点击成本</div>
+          </div>
+          <div className="kpi">
+            <div className="k-label">待处理</div>
+            <div className="k-value">{isErr(a) ? '—' : a.open_count}</div>
+            <div className="k-extra">条归因窗在跟踪</div>
+          </div>
+        </div>
+      )}
       {/* ① 账户漏斗趋势 */}
       <div className="card">
         <h2>
@@ -99,12 +171,31 @@ export default function Cockpit() {
               <span className="tag">ACOS {fmtPct(f.totals.acos)}</span>
               <span className="tag">CPC {f.totals.cpc == null ? '—' : `$${Number(f.totals.cpc).toFixed(2)}`}</span>
             </div>
-            <div className="small muted">每日花费</div>
-            <svg width={W} height={70}><Line values={costs} width={W} height={70} color="#2563eb" /></svg>
-            <div className="small muted">每日 ACOS</div>
-            <svg width={W} height={60}><Line values={acoss} width={W} height={60} color="#d97706" /></svg>
-            <div className="small muted">每日 CVR</div>
-            <svg width={W} height={60}><Line values={cvrs} width={W} height={60} color="#0d9488" /></svg>
+            <div className="small muted">
+              每日花费
+              {dates.length > IMMATURE_DAYS && (
+                <span className="muted"> · 右侧灰区是还没结算的最后 {IMMATURE_DAYS} 天</span>
+              )}
+            </div>
+            <svg className="chart" viewBox={`0 0 ${W} ${70}`}>
+              <Line values={costs} width={W} height={70} color="#2563eb" labels={dates} format={fmtMoney} immature={IMMATURE_DAYS} />
+            </svg>
+            {/* ACOS 与 CVR 并排：它们共用一个横轴、量级都是百分比，竖着叠三张
+                等于让眼睛上下跑三趟才能把同一天的三个数对上。宽屏两列，窄屏自动回单列。 */}
+            <div className="mini-grid">
+              <div>
+                <div className="small muted">每日 ACOS</div>
+                <svg className="chart" viewBox={`0 0 ${MINI_W} ${MINI_H}`}>
+                  <Line values={acoss} width={MINI_W} height={MINI_H} color="#d97706" labels={dates} format={(v) => fmtPct(v)} immature={IMMATURE_DAYS} />
+                </svg>
+              </div>
+              <div>
+                <div className="small muted">每日 CVR</div>
+                <svg className="chart" viewBox={`0 0 ${MINI_W} ${MINI_H}`}>
+                  <Line values={cvrs} width={MINI_W} height={MINI_H} color="#0d9488" labels={dates} format={(v) => fmtPct(v)} immature={IMMATURE_DAYS} />
+                </svg>
+              </div>
+            </div>
           </>
         )}
       </div>
@@ -118,7 +209,7 @@ export default function Cockpit() {
         {isErr(p) ? (
           <div className="err">{p.error}</div>
         ) : (
-          <svg width={W} height={(p.portfolios || []).length * 24 + 8}>
+          <svg className="chart" viewBox={`0 0 ${W} ${(p.portfolios || []).length * 24 + 8}`}>
             {(p.portfolios || []).map((x: any, i: number) => (
               <g key={x.name} transform={`translate(0, ${i * 24 + 2})`}>
                 <IntervalBar label={x.name} lo={x.cvr_lo} hi={x.cvr_hi} point={x.cvr} max={pfMax} width={W} />
@@ -231,7 +322,7 @@ export default function Cockpit() {
         {isErr(k) ? (
           <div className="err">{k.error}</div>
         ) : (
-          <svg width={W} height={(k.keywords || []).length * 22 + 8}>
+          <svg className="chart" viewBox={`0 0 ${W} ${(k.keywords || []).length * 22 + 8}`}>
             {(k.keywords || []).map((x: any, i: number) => (
               <g key={x.keyword_text} transform={`translate(0, ${i * 22 + 2})`}>
                 <BarRow
@@ -395,8 +486,9 @@ export default function Cockpit() {
                 <th>对象</th>
                 <th>动作</th>
                 <th>改于</th>
-                <th>到期</th>
-                <th className="num">剩余</th>
+                <th>窗末</th>
+                <th>可结算</th>
+                <th className="num">距结算</th>
                 <th>状态</th>
               </tr>
             </thead>
@@ -406,7 +498,11 @@ export default function Cockpit() {
                   <td>{d.entity_label}</td>
                   <td className="small">{d.action_type}</td>
                   <td className="small muted">{(d.executed_at || '').slice(0, 16)}</td>
+                  {/* 窗末 ≠ 可结算：报表要过几天才把窗口最后几天回传齐，
+                      归因 agent 等到 settle_at 才动手。分两列写，免得
+                      「到期了怎么还没回填」这种误读。 */}
                   <td className="small muted">{(d.attribution_due_at || '').slice(0, 16)}</td>
+                  <td className="small muted">{(d.settle_at || '—').slice(0, 16)}</td>
                   <td className="num">{d.days_left ?? '—'}</td>
                   <td>
                     <span className={`tag ${d.overdue ? 'over' : 'ok'}`}>

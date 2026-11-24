@@ -97,7 +97,12 @@ def main() -> int:
         # 效应还没显现就判「无效」，attribute 会永久产出 weak。
         # 这里逐项钉死，防止哪天常量又被调短而没人发现。
         plan_days = {
-            "raise_budget": 3, "reduce_budget": 3, "lower_budget": 3,
+            # 预算三类由计划书的 3 天改为 5 天：计划书写 3 天时的前提是「窗一到
+            # 就结算」，而窗末最后 1~2 天的订单还没回传，3 天里能用的其实只有
+            # 1~2 天。现在 attribute 改成「窗满 + 3 天回传缓冲」才结算，3 天窗
+            # 的样本量仍然太薄（判一次预算动作至少要看 5 天量级变化），故上调。
+            # 计划书 §4.4 表格已同步注明。
+            "raise_budget": 5, "reduce_budget": 5, "lower_budget": 5,
             "reduce_bid": 7, "raise_bid": 7,
             "add_negative": 14, "adjust_placement": 7,
             "harvest_keyword": 14, "harvest": 14, "pause_candidate": 14,

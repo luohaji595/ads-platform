@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter
@@ -82,6 +83,21 @@ def freshness():
         executed = conn.execute(
             "select count(*) as n from decision_log where status='executed'"
         ).fetchone()["n"]
+        # 顶栏徽章要用的两个「等人处理」计数。
+        # policy 表在老库可能不存在 —— 徽章显示 0 远好过让整个 /freshness 500：
+        # 全局顶栏每个页面都吃这个接口，不能因为一张后加的表缺失就全站黑屏。
+        try:
+            pending_policy = conn.execute(
+                "select count(*) as n from policy where status='proposed'"
+            ).fetchone()["n"]
+        except sqlite3.Error:
+            pending_policy = 0
+        try:
+            open_objection = conn.execute(
+                "select count(*) as n from agent_objection where verdict is null or verdict=''"
+            ).fetchone()["n"]
+        except sqlite3.Error:
+            open_objection = 0
 
     stale_any = any(v["stale"] for v in out.values())
     return {
@@ -90,7 +106,13 @@ def freshness():
         "stale_any": stale_any,
         "last_run": dict(run) if run else None,
         "last_memorial": dict(mem) if mem else None,
-        "counts": {"proposed": pending, "approved": approved, "executed": executed},
+        "counts": {
+            "proposed": pending,
+            "approved": approved,
+            "executed": executed,
+            "pending_policy": pending_policy,
+            "open_objection": open_objection,
+        },
     }
 
 

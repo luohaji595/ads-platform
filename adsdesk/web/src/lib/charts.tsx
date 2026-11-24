@@ -16,38 +16,78 @@ export function Line({
   height,
   color = '#2563eb',
   fill = true,
+  immature = 0,
+  labels,
+  format,
 }: {
   values: (number | null)[]
   width: number
   height: number
   color?: string
   fill?: boolean
+  /** 末尾还有几天报表没回填归因：留白不画线，画成虚线区，别让人把半截数据当结论 */
+  immature?: number
+  /** 每个点的横轴标签。给了才出原生 hover 提示，不给就纯图 */
+  labels?: string[]
+  /** hover 提示里的数值格式 */
+  format?: (v: number) => string
 }) {
-  const nums = values.map((v) => (v == null ? null : v)) as (number | null)[]
+  const nums = values as (number | null)[]
   const valid = nums.filter((v): v is number => v != null)
   if (valid.length < 2) return <text x={4} y={height / 2} className="svg-empty">数据不足</text>
   const min = Math.min(...valid)
   const max = Math.max(...valid)
   const span = max - min || 1
-  const step = width / (nums.length - 1)
-  const pts: string[] = []
+  // 末尾留白也占横轴：否则最后一天紧贴右边框，看不出「还有两天没结算」。
+  const slots = nums.length + Math.max(0, immature)
+  const step = width / Math.max(1, slots - 1)
+  const yOf = (v: number) => height - ((v - min) / span) * (height - 8) - 4
+  // 遇到 null 就断开，不要一条线跨过缺口 —— 跨过去等于替缺数据的那几天编了个值。
+  const segs: string[] = []
+  let cur: string[] = []
   nums.forEach((v, i) => {
-    if (v == null) return
-    const x = i * step
-    const y = height - ((v - min) / span) * (height - 8) - 4
-    pts.push(`${x.toFixed(1)},${y.toFixed(1)}`)
+    if (v == null) {
+      if (cur.length) {
+        segs.push(`M ${cur.join(' L ')}`)
+        cur = []
+      }
+      return
+    }
+    cur.push(`${(i * step).toFixed(1)},${yOf(v).toFixed(1)}`)
   })
-  const d = `M ${pts.join(' L ')}`
+  if (cur.length) segs.push(`M ${cur.join(' L ')}`)
+  const d = segs[0] || ''
+  // 未成熟区从「最后一个点的半步之后」起算到右边框。
+  const bandX = Math.max(0, (nums.length - 1 + 0.5) * step)
+  const fillRight = immature > 0 ? bandX : width
   return (
     <>
-      {fill && (
+      {fill && d && (
         <path
-          d={`${d} L ${width},${height} L 0,${height} Z`}
+          d={`${d} L ${fillRight.toFixed(1)},${height} L 0,${height} Z`}
           fill={color}
           opacity={0.08}
         />
       )}
-      <path d={d} fill="none" stroke={color} strokeWidth={1.6} />
+      {segs.map((seg, i) => (
+        <path key={i} d={seg} fill="none" stroke={color} strokeWidth={1.6} />
+      ))}
+      {immature > 0 && (
+        <>
+          <rect x={bandX} y={0} width={Math.max(0, width - bandX)} height={height} fill="#94a3b8" opacity={0.1}>
+            <title>{`末 ${immature} 天报表还在回传归因，这几天不进判断`}</title>
+          </rect>
+          <line className="dash" x1={bandX} y1={0} x2={bandX} y2={height} stroke="#94a3b8" strokeWidth={1} />
+        </>
+      )}
+      {labels &&
+        nums.map((v, i) =>
+          v == null ? null : (
+            <circle key={`h${i}`} cx={i * step} cy={yOf(v)} r={5} fill="transparent">
+              <title>{`${labels[i] ?? ''} ${format ? format(v) : v}`}</title>
+            </circle>
+          )
+        )}
     </>
   )
 }

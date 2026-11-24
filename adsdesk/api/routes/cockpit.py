@@ -19,6 +19,9 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException
 
 from api.db import read_conn
+# 结算缓冲的唯一真源在 agents/attribute.py：页面判「该回填了没」必须跟归因
+# agent 用同一个值，否则页面标红三天、agent 却按兵不动（或者反过来）。
+from agents.attribute import ATTR_SETTLE_LAG_DAYS
 
 router = APIRouter()
 
@@ -537,8 +540,14 @@ def attribution():
         seen7 = _load_json(d.pop("outcome_7d_json", None))
         seen14 = _load_json(d.pop("outcome_14d_json", None))
         due = d.get("attribution_due_at")
-        d["overdue"] = bool(due and due <= now)
-        d["days_left"] = _days_left(due)
+        # attribution_due_at 是「窗口最后一天」，不是「可以结算的那天」。
+        # 归因 agent 要等报表把这几天回传完（ATTR_SETTLE_LAG_DAYS）才动手；
+        # 页面若按 due 判 overdue，就会出现「标了该回填、归因却不动」的三天
+        # 假红。所以这里单独算 settle_at，红不红看它。
+        settle = _shift_days(due, ATTR_SETTLE_LAG_DAYS)
+        d["settle_at"] = settle
+        d["overdue"] = bool(settle and settle <= now)
+        d["days_left"] = _days_left(settle)
         # 一条执行会看两次：到期看 7 天，再往后看 14 天终局。
         # 页面要能分清「还没看过」和「看过一次、等终局」，否则到期那条会
         # 一直挂红却没人知道已经填过一次了。
@@ -572,6 +581,17 @@ def _load_json(raw):
     except (ValueError, TypeError):
         return None
     return val if isinstance(val, dict) else None
+
+
+def _shift_days(ts: str | None, days: int) -> str | None:
+    """ISO 时间串 + N 天。解析不了就返回 None（页面显示 —，不猜）。"""
+    if not ts or not days:
+        return ts
+    try:
+        return (datetime.fromisoformat(ts) + timedelta(days=days)).isoformat(
+            timespec="seconds")
+    except (ValueError, TypeError):
+        return None
 
 
 def _days_left(due: str | None) -> int | None:

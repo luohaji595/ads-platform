@@ -5,6 +5,10 @@ import {
   getAgentObjections,
   getAgentRuns,
   getAgentSummary,
+  getPolicyPending,
+  activatePolicy,
+  rejectPolicy,
+  type PolicyRow,
   type AgentEvalByAgent,
   type AgentObjectionRow,
   type AgentObjectionSummary,
@@ -22,7 +26,7 @@ import {
 type Load<T> = { data: T | null; err: string | null }
 
 /** 每块自己取数、自己报错：一块挂了不影响其它块（和后端 summary 的容错对齐）。 */
-function useLoad<T>(run: () => Promise<T>): Load<T> {
+function useLoad<T>(run: () => Promise<T>, deps: unknown[] = []): Load<T> {
   const [s, setS] = useState<Load<T>>({ data: null, err: null })
   useEffect(() => {
     let alive = true
@@ -36,9 +40,9 @@ function useLoad<T>(run: () => Promise<T>): Load<T> {
     return () => {
       alive = false
     }
-    // run 是每次渲染新建的闭包，故意不放进依赖，只在挂载时取一次
+    // run 是每次渲染新建的闭包，不能直接进依赖；要重取就传 deps（例如筛选/排序）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, deps)
   return s
 }
 
@@ -54,6 +58,17 @@ function dur(sec: number | null) {
 }
 
 const pct = (rate: number | null) => (rate == null ? null : `${(rate * 100).toFixed(0)}%`)
+
+/** 还剩几天到期。反对的「对不对」是到期才判的，光看日期还得自己数天数。 */
+function daysLeft(s: string | null | undefined): string {
+  if (!s) return ''
+  const t = new Date(s).getTime()
+  if (!Number.isFinite(t)) return ''
+  const d = Math.ceil((t - Date.now()) / 86_400_000)
+  if (d > 0) return `还有 ${d} 天`
+  if (d === 0) return '今天判定'
+  return `已过 ${-d} 天`
+}
 
 type Tone = { cls: string; label: string }
 
@@ -215,22 +230,134 @@ function PredictCell({ o }: { o: AgentObjectionRow }) {
       {o.predicts.map((p, i) => (
         <div key={i} className="small" style={{ marginBottom: 4 }}>
           <div>{p.claim || p.expected || '（没有描述）'}</div>
-          {p.verifiable_at && <div className="muted">到期 {day(p.verifiable_at)}</div>}
+          {p.verifiable_at && (
+                <div className="muted">
+                  到期 {day(p.verifiable_at)} · {daysLeft(p.verifiable_at)}
+                </div>
+              )}
         </div>
       ))}
     </div>
   )
 }
 
+// ───────────────────────── ⓪ 待认领的策略 ─────────────────────────
+
+/**
+ * 归因 agent 只在「7/14 天对照实测有效」时才提案，攒不够就不出现 —— 所以这里
+ * 大部分时候是空的，空态要写清为什么空，否则人会以为坏了。
+ *
+ * 认领＝写库（policy.status: proposed → active），引擎下次跑就按它行事；
+ * 驳回＝留痕不生效。两者都只改 policy 表，不碰广告后台。
+ */
+function PolicyCard({ signal }: { signal?: number }) {
+  const [rows, setRows] = useState<PolicyRow[] | null>(null)
+  const [note, setNote] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [busy, setBusy] = useState<number | null>(null)
+  const [msg, setMsg] = useState<string | null>(null)
+
+  const load = () => {
+    setErr(null)
+    getPolicyPending()
+      .then((r) => {
+        setRows(r.policies)
+        setNote(r.note)
+      })
+      .catch((e: unknown) => setErr(String((e as Error)?.message || e)))
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(load, [])
+
+  // 常驻挂载：App 轮询到新数据时把 signal 加一，这里跟着重取（归因 agent 新提案要能自己冒出来）
+  useEffect(() => {
+    if (signal) load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signal])
+
+  async function act(id: number, kind: 'activate' | 'reject') {
+    setBusy(id)
+    setMsg(null)
+    try {
+      if (kind === 'activate') await activatePolicy(id)
+      else await rejectPolicy(id)
+      setMsg(`policy #${id} 已${kind === 'activate' ? '认领，引擎下次跑就按它行事' : '驳回，不生效'}`)
+      load()
+    } catch (e: unknown) {
+      setMsg(`#${id} 失败：${String((e as Error)?.message || e)}`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div className="card">
+      <h2>
+        待认领的策略
+        <span className="sub">归因实测有效才提案 —— 认领后引擎就按它行事</span>
+      </h2>
+      {err && <div className="err">读不到策略：{err}</div>}
+      {!err && !rows && <div className="note">读取中…</div>}
+      {rows && rows.length === 0 && <div className="note">{note || '没有待认领的策略。'}</div>}
+      {rows &&
+        rows.map((r) => (
+          <div key={r.policy_id} style={{ borderTop: '1px solid var(--line)', paddingTop: 10, marginTop: 10 }}>
+            <div className="row">
+              <b>{r.type_label}</b>
+              <span className="tag">{r.object_id}</span>
+              {r.decision_id != null && <span className="tag">来自决策 #{r.decision_id}</span>}
+            </div>
+            {r.evidence_text && (
+              <div className="small muted" style={{ margin: '6px 0' }}>
+                {r.evidence_text}
+              </div>
+            )}
+            <div className="small muted">来源 {r.source}</div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="btn primary" disabled={busy === r.policy_id} onClick={() => act(r.policy_id, 'activate')}>
+                认领（以后按这个来）
+              </button>
+              <button className="btn" disabled={busy === r.policy_id} onClick={() => act(r.policy_id, 'reject')}>
+                驳回
+              </button>
+            </div>
+          </div>
+        ))}
+      {msg && <div className="note" style={{ marginTop: 8 }}>{msg}</div>}
+    </div>
+  )
+}
+
 function ObjectionsCard() {
-  const { data, err } = useLoad(() => getAgentObjections(20, 'all'))
+  // 排序是给人换视角用的：'recent' 看 agent 最近在担心什么，
+  // 'due' 看「这几天该判的判了没」。表里 35 条有 26 条没写兑现日，
+  // 所以到期日排序必须让后端排（前端只能排已返回的 20 条）。
+  const [sort, setSort] = useState<'recent' | 'due'>('recent')
+  const { data, err } = useLoad(() => getAgentObjections(20, 'all', sort), [sort])
   const sum: AgentObjectionSummary | null = data?.summary ?? null
+  // 已到期但还没判的：这是唯一需要人动手的队列，值得单独报个数。
+  const overdue = (data?.objections ?? []).filter(
+    (o) => o.outcome === 'pending' && o.verifiable_at && daysLeft(o.verifiable_at).startsWith('已过'),
+  ).length
   return (
     <div className="card">
       <h2>
         反对与兑现
         <span className="sub">agent 当时反对了什么，到期后对不对</span>
+        <span className="segmented" style={{ marginLeft: 'auto' }}>
+          <button className={sort === 'recent' ? 'on' : ''} onClick={() => setSort('recent')}>
+            最近
+          </button>
+          <button className={sort === 'due' ? 'on' : ''} onClick={() => setSort('due')}>
+            按到期日
+          </button>
+        </span>
       </h2>
+      {overdue > 0 && (
+        <div className="warn">
+          本页有 {overdue} 条已过兑现日但还没判定 —— 判定由流程做，这里只是提醒你它已经过期了。
+        </div>
+      )}
       {err && <div className="err">读不到反对记录：{err}</div>}
       {!err && !data && <div className="note">读取中…</div>}
       {sum && (
@@ -269,7 +396,12 @@ function ObjectionsCard() {
                 </td>
                 <td>
                   <PredictCell o={o} />
-                  {o.verifiable_at && <div className="muted small">判定日 {day(o.verifiable_at)}</div>}
+                  {o.verifiable_at && (
+                    <div className="muted small">
+                      判定日 {day(o.verifiable_at)}
+                      {o.outcome && o.outcome !== 'pending' ? '' : ` · ${daysLeft(o.verifiable_at)}`}
+                    </div>
+                  )}
                 </td>
                 <td>
                   <Tag map={OUTCOME} value={o.outcome} />
@@ -415,7 +547,7 @@ function AssumptionsCard() {
 
 // ───────────────────────── 页面 ─────────────────────────
 
-export default function AgentPanel() {
+export default function AgentPanel({ signal }: { signal?: number }) {
   return (
     <div>
       <div className="card tight">
@@ -430,6 +562,7 @@ export default function AgentPanel() {
         </div>
         <SummaryStrip />
       </div>
+      <PolicyCard signal={signal} />
       <RunsCard />
       <ObjectionsCard />
       <EvalsCard />
