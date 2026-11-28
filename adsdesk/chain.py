@@ -48,6 +48,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 DB = os.environ.get("ADS_DB") or str(ROOT / "ingest" / "data" / "ads.sqlite3")
@@ -75,6 +76,10 @@ RANK_FRESH_HOURS = 4   # 仅用于诊断输出提示，不参与 step_done
 FACT_TABLES = ("fact_campaign_daily", "fact_keyword_daily",
                "fact_search_term_daily", "fact_placement_daily")
 INGEST_LOOKBACK_MAX = 30   # 最多往前补 30 天，防止一次拉爆接口
+# 这条链服务的是哪个店。写在常量里而不是散在 build_cmd 的字面量 "7" 上：
+# 日期口径（market_today）和 ingest/rank 的 --market 必须是同一个数，
+# 否则会出现「按 7 号店的时区算日子、去拉 1 号店的数」。
+MARKET_ID = 7
 
 
 # ---------------------------------------------------------------- 基础设施
@@ -135,6 +140,37 @@ def coverage(conn: sqlite3.Connection) -> dict[str, str | None]:
     return out
 
 
+def market_today(conn: sqlite3.Connection, market_id: int = MARKET_ID) -> date:
+    """店铺「今天」是哪一天 —— 按 dim_market.timezone 算，不是按本机。
+
+    这条链上每一处「昨天该有数据了」的判断都从这里取日期。
+    早先全用 `date.today()`（本机 CST），而 7 号店是 US/Pacific，差 16 小时：
+    北京时间 11-26 上午 8 点，洛杉矶还是 11-25 下午 4 点 —— 此时按 CST 判
+    「D-1 = 11-25 应该有数据」，而站点那边 11-25 才过了 2/3，
+    链会把「数据没追平」当成失败，反复重试 8 次（ingest 上限），
+    最后把当天标记成 failed，而其实只是时区没对齐。
+
+    读不到时区就退回本机日期并打一行警告 —— 静默用错的值，错的是整条链的完成判定。
+    """
+    row = None
+    try:
+        row = conn.execute(
+            "select timezone from dim_market where market_id=?", (market_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    tz = ((row["timezone"] if row else "") or "").strip()
+    if tz:
+        try:
+            return datetime.now(ZoneInfo(tz)).date()
+        except Exception as e:
+            say(f"[时区] dim_market 里的 {tz!r} 用不了（{e}），退回本机日期")
+    else:
+        say(f"[时区] market {market_id} 没有 timezone，退回本机日期 {date.today()}")
+    return date.today()
+
+
+
 def _iso_week(day: str) -> str:
     """2026-11-19 → 2026-W47。与 ingest/market.py 写库时的周键同一口径。"""
     d = date.fromisoformat(day)
@@ -161,8 +197,12 @@ def _market_covered(conn: sqlite3.Connection, today: str) -> set[str]:
     """今天已经成功采过的数据集。run_log.dataset 形如 market.aba+competitor+market。"""
     got: set[str] = set()
     for r in conn.execute(
-            "select dataset from run_log where status='ok' and dataset like 'market.%' "
-            "and substr(coalesce(finished_at, started_at),1,10)=?", (today,)):
+            "select dataset, coalesce(finished_at, started_at) ts from run_log "
+            "where status='ok' and dataset like 'market.%' "
+            "and substr(coalesce(finished_at, started_at),1,10) in (?,?,?)",
+            _day_window(today)):
+        if not _is_local_day(r["ts"], today):
+            continue
         for d in str(r["dataset"]).split(".", 1)[1].split("+"):
             if d:
                 got.add(d)
@@ -182,18 +222,49 @@ def freshness(conn: sqlite3.Connection, today: str) -> str:
     return (row["f"] if row and row["f"] else f"{today}T00:00:00")
 
 
-def step_done(conn: sqlite3.Connection, step: str, today: str) -> tuple[bool, str]:
-    """今天这一步是否已经成功（且用的是最新的数据）。返回 (完成?, 依据)。"""
+def step_done(conn: sqlite3.Connection, step: str, today: str,
+              market_day: str | None = None) -> tuple[bool, str]:
+    """今天这一步是否已经成功（且用的是最新的数据）。返回 (完成?, 依据)。
+
+    两个日期不是一回事，混用会让整条链空转：
+
+      `today`（调用方传 CST 日）—— 用来问「今天做过没」。
+          底下这些时间列写的都是 CST 日或 UTC 日，没有一个是 LA 日：
+          chain_run.business_day / run_log.finished_at / agent_run.started_at /
+          converge_run.started_at 是 CST；engine_run.started_at / memorial.created_at
+          是 UTC（`engine/run.py` 的 `_now()`）。`step_done` 和 `_started_after`
+          统一先用 `_ts()` 转成本地 CST 再按日比对，这样 CST 00:00~07:59 用
+          `--force` 跑（对应 UTC 前一天 16:00Z~23:59Z）也能正确认出当轮结果。
+
+      `market_day`（LA 日）—— 只在「站点那边哪一天已经过完」这件事上有意义：
+          ABA 的周键要按它算，否则北京周一凌晨会被判成「本周还没采」白烧额度。
+
+    2026-11-26 踩过：把 `today` 从 CST 日整体换成 LA 日，`step_done` 里 6 处
+    `substr(<时间列>,1,10)=today` 全部失配（LA 日比 CST 日慢 16 小时，CST 上午
+    还停在前一天）。后果是当天真的跑过的一轮被判成「今天没跑」→ 重跑；
+    或者昨天 CST 上午跑的那轮被判成「今天已跑」→ 整条链 7/7 步空转跳过。
+    错位区间是 CST 09:00~15:59，正好落在运行窗里 7/15 的时间上。
+    """
+    # 不传就自己算 —— 调用点有 3 处（run_step 复验、--status、run_step 前置），
+    # 让它们各自去取一次反而容易漏掉某一处，变成「有的步骤按店铺日、有的按 CST 日」。
+    market_day = market_day or market_today(conn).isoformat()
     if step == "ingest":
         cov = coverage(conn)
-        target = (date.today() - timedelta(days=1)).isoformat()
+        # 目标日按**店铺日**算（US/Pacific 比 CST 慢 16 小时）。
+        # 用本机日期会在北京时间上午把「站点那边还没过完的今天」当成 D-1，
+        # 于是链每半小时重试一次 ingest，8 次用完后把当天记成 failed。
+        # 走 market_day 参数而不是再调一次 market_today()：同一次判定里
+        # 「哪一天」只能有一个来源，否则调用方传了值、这里又自己算，两者不一致时没人看得出来。
+        target = (date.fromisoformat(market_day) - timedelta(days=1)).isoformat()
         behind = {t: v for t, v in cov.items() if (v or "") < target}
         if behind:
             return False, "；".join(f"{t.replace('fact_', '').replace('_daily', '')} 止于 {v or '空'}"
                                    for t, v in behind.items()) + f"（目标 {target}）"
         return True, f"四张事实表均已到 {target}"
     if step == "market":
-        want = market_datasets(conn, today)
+        # ABA 的周键按**店铺日**算（_iso_week 用的是这个参数），
+        # 「今天采过没」按 CST 日查 run_log —— 两个日期各管一件事。
+        want = market_datasets(conn, market_day)
         got = _market_covered(conn, today)
         missing = [d for d in want if d not in got]
         if missing:
@@ -207,17 +278,22 @@ def step_done(conn: sqlite3.Connection, step: str, today: str) -> tuple[bool, st
         # 我们重跑十次也拿不到一条更新的观测。数据老不老该由 R31 的
         # RANK_SNAPSHOT_MAX_AGE_HOURS 闸去管（它读到旧数据就停手，这是对的），
         # 采集步只需要证明「我今天问过了」，否则守夜人会一直红着重试。
-        row = conn.execute(
-            "select count(*) c from run_log where status='ok' and dataset like 'rank.%' "
-            "and substr(coalesce(finished_at, started_at),1,10)=?", (today,)).fetchone()
-        if not row["c"]:
+        cnt = sum(
+            1 for r in conn.execute(
+                "select coalesce(finished_at, started_at) ts from run_log "
+                "where status='ok' and dataset like 'rank.%' "
+                "and substr(coalesce(finished_at, started_at),1,10) in (?,?,?)",
+                _day_window(today))
+            if _is_local_day(r["ts"], today)
+        )
+        if not cnt:
             return False, "今天还没有成功的位次采集"
         obs = conn.execute(
             "select max(observed_at) m, count(*) c from rank_snapshot "
             "where is_self=1 and placement='sponsored'").fetchone()
         last = _ts(obs["m"])
         age = f"，最新观测 {obs['m']}（{(datetime.now() - last).total_seconds() / 3600.0:.1f}h 前）" if last else ""
-        return True, f"今天已轮询 {row['c']} 次{age}"
+        return True, f"今天已轮询 {cnt} 次{age}"
 
     if step == "midship":
         # 判定的是「今天有没有成功投影过」，读 run_log（真实状态），不读 chain_run。
@@ -225,48 +301,79 @@ def step_done(conn: sqlite3.Connection, step: str, today: str) -> tuple[bool, st
         # 「跑完 → 复验 → 才 record」，所以第一次成功也必判 failed —— 链会一直
         # 重试到 MAX_ATTEMPTS 然后报红。现在由 midship 自己在退出前写 run_log
         # （dataset='midship.project'），和 rank/market 一个路子。
-        row = conn.execute(
-            "select count(*) c, max(substr(coalesce(finished_at, started_at),12,8)) t "
-            "from run_log where status='ok' and dataset like 'midship%' "
-            "and substr(coalesce(finished_at, started_at),1,10)=?", (today,)).fetchone()
-        if not row["c"]:
+        times = [
+            dt for r in conn.execute(
+                "select coalesce(finished_at, started_at) ts from run_log "
+                "where status='ok' and dataset like 'midship%' "
+                "and substr(coalesce(finished_at, started_at),1,10) in (?,?,?)",
+                _day_window(today))
+            if (dt := _ts(r["ts"])) and dt.date().isoformat() == today
+        ]
+        if not times:
             return False, "今天还没有成功的事件中台投影"
-        return True, f"今天已投影 {row['c']} 次（最近 {row['t'] or '—'}）"
+        return True, f"今天已投影 {len(times)} 次（最近 {max(times):%H:%M:%S}）"
 
     fresh = freshness(conn, today)
     if step == "engine":
-        row = conn.execute(
-            "select run_id, window_end from engine_run where status='ok' "
-            "and substr(started_at,1,10)=? order by run_id desc limit 1", (today,)).fetchone()
+        row = _latest_row_on_day(
+            conn,
+            "select run_id, status, window_end, started_at from engine_run "
+            "where substr(started_at,1,10) in (?,?,?) order by run_id desc",
+            "started_at", today)
         if not row:
-            return False, "今天还没有成功的 engine_run"
+            return False, "今天还没有 engine_run"
+        if row["status"] != "ok":
+            return False, f"engine_run #{row['run_id']} 状态 {row['status']}，这一轮没跑成，需重跑"
         if _started_after(conn, "engine_run", "started_at", today, fresh):
             return True, f"engine_run #{row['run_id']}（窗口末 {row['window_end']}，晚于取数 {fresh[11:16]}）"
         return False, f"engine_run #{row['run_id']} 早于今天取数完成时刻 {fresh[11:16]}，数据已变新需重跑"
     if step == "diagnose":
-        row = conn.execute(
-            "select run_id, business_day from memorial where agent_state='ok' "
-            "and substr(created_at,1,10)=? order by run_id desc limit 1", (today,)).fetchone()
+        row = _latest_row_on_day(
+            conn,
+            "select run_id, agent_state, business_day, created_at from memorial "
+            "where substr(created_at,1,10) in (?,?,?) order by run_id desc",
+            "created_at", today)
         if not row:
-            return False, "今天还没有 ok 的诊断"
+            return False, "今天还没有诊断"
+        # pending 不等于失败：memorial 是先插行再回填结果的，进程被杀会留下 pending。
+        # 所以只把 failed 说成「没跑成」，pending 说成「没跑完」—— 两者的下一步一样
+        # （都要重跑），但「pending」还多一种可能：正在跑，那就别抢。
+        if row["agent_state"] == "failed":
+            return False, f"memorial #{row['run_id']} 诊断失败（agent_state=failed），需重跑"
+        if row["agent_state"] != "ok":
+            return False, f"memorial #{row['run_id']} 还没跑完（agent_state={row['agent_state']}）"
         if _started_after(conn, "memorial", "created_at", today, fresh):
             return True, f"memorial #{row['run_id']}（窗口末 {row['business_day']}，晚于取数 {fresh[11:16]}）"
         return False, f"memorial #{row['run_id']} 早于今天取数完成时刻 {fresh[11:16]}，数据已变新需重诊断"
     if step == "attribute":
-        row = conn.execute(
-            "select agent_run_id from agent_run where job='attribute' and status='ok' "
-            "and substr(started_at,1,10)=? order by agent_run_id desc limit 1", (today,)).fetchone()
+        row = _latest_row_on_day(
+            conn,
+            "select agent_run_id, status, started_at from agent_run where job='attribute' "
+            "and substr(started_at,1,10) in (?,?,?) order by agent_run_id desc",
+            "started_at", today)
         if not row:
-            return False, "今天还没有成功的归因"
+            return False, "今天还没有归因"
+        if row["status"] != "ok":
+            return False, f"agent_run #{row['agent_run_id']} 状态 {row['status']}，这一轮没跑成，需重跑"
         if _started_after(conn, "agent_run", "started_at", today, fresh, "job='attribute' and "):
             return True, f"agent_run #{row['agent_run_id']}（晚于取数 {fresh[11:16]}）"
         return False, f"agent_run #{row['agent_run_id']} 早于今天取数完成时刻 {fresh[11:16]}，需重跑"
     if step == "converge":
-        row = conn.execute(
-            "select converge_run_id, n_due, n_filled, n_deferred from converge_run where status='ok' "
-            "and substr(started_at,1,10)=? order by converge_run_id desc limit 1", (today,)).fetchone()
+        row = _latest_row_on_day(
+            conn,
+            "select converge_run_id, status, n_due, n_filled, n_deferred, error, started_at "
+            "from converge_run where substr(started_at,1,10) in (?,?,?) "
+            "order by converge_run_id desc",
+            "started_at", today)
         if not row:
-            return False, "今天还没有成功的 converge_run"
+            return False, "今天还没有 converge_run"
+        # 跑过但失败，不能显示成「还没跑」。
+        # converge.py 把模型整体不可用记成 status='degraded'（那一轮确实没做完），
+        # 而这里原来只查 status='ok'，于是「跑了但挂了」和「压根没跑」长得一模一样 ——
+        # 前者要去看 error、后者要等它跑，处置完全相反。
+        if row["status"] != "ok":
+            return False, (f"converge_run #{row['converge_run_id']} 跑过了但状态 {row['status']}"
+                           f"（{row['error'] or '无 error 记录'}），到期断言没处理完，需重跑")
         if _started_after(conn, "converge_run", "started_at", today, fresh):
             return True, (f"converge_run #{row['converge_run_id']}"
                           f"（到期 {row['n_due']} / 回填 {row['n_filled']} / 暂不判 {row['n_deferred']}，"
@@ -291,11 +398,34 @@ def _ts(value: str | None) -> datetime | None:
     return d.replace(tzinfo=None) if d.tzinfo is None else d.astimezone().replace(tzinfo=None)
 
 
+def _day_window(day: str) -> tuple[str, str, str]:
+    """返回 (前一天, 当天, 后一天)，先在 SQL 里缩小扫描范围，再交由 _ts() 精确判本地日。"""
+    d = date.fromisoformat(day)
+    return ((d - timedelta(days=1)).isoformat(), day, (d + timedelta(days=1)).isoformat())
+
+
+def _is_local_day(value: str | None, day: str) -> bool:
+    dt = _ts(value)
+    return bool(dt and dt.date().isoformat() == day)
+
+
+def _latest_row_on_day(conn: sqlite3.Connection, sql: str, ts_col: str, today: str):
+    """在已降序的近三天候选行里，取第一条本地 CST 日期等于 today 的记录。"""
+    for r in conn.execute(sql, _day_window(today)):
+        if _is_local_day(r[ts_col], today):
+            return r
+    return None
+
+
 def _started_after(conn, table: str, col: str, today: str, fresh: str, extra: str = "") -> bool:
     """该表今天最近一次成功是否晚于数据变新的时刻。"""
     st = "status='ok' and " if table != "memorial" else "agent_state='ok' and "
-    sql = (f"select max({col}) m from {table} where {extra}{st}substr({col},1,10)=?")
-    m, f = _ts(conn.execute(sql, (today,)).fetchone()["m"]), _ts(fresh)
+    sql = f"select {col} ts from {table} where {extra}{st}substr({col},1,10) in (?,?,?)"
+    times = [
+        dt for r in conn.execute(sql, _day_window(today))
+        if (dt := _ts(r["ts"])) and dt.date().isoformat() == today
+    ]
+    m, f = (max(times) if times else None), _ts(fresh)
     return bool(m and f and m >= f)
 
 
@@ -331,12 +461,12 @@ def net_ready(deadline_s: int = 300) -> bool:
 
 def build_cmd(step: str, model: str) -> list[str]:
     if step == "ingest":
-        return [PY, str(ROOT / "ingest" / "ingest.py"), "--market", "7"]
+        return [PY, str(ROOT / "ingest" / "ingest.py"), "--market", str(MARKET_ID)]
     if step == "market":
         # 数据集不写死：ABA 是周数据，本周采到了就不该每天再花 30 次额度重采
         return [PY, str(ROOT / "ingest" / "market.py")]
     if step == "rank":
-        return [PY, str(ROOT / "ingest" / "rank.py"), "--dataset", "all", "--market", "7"]
+        return [PY, str(ROOT / "ingest" / "rank.py"), "--dataset", "all", "--market", str(MARKET_ID)]
     if step == "engine":
         return [PY, str(ROOT / "engine" / "run.py")]
     if step == "diagnose":
@@ -352,9 +482,16 @@ def build_cmd(step: str, model: str) -> list[str]:
     raise KeyError(step)
 
 
-def ingest_args(conn: sqlite3.Connection) -> tuple[list[str], str]:
-    """把 ingest 的起止日算成「缺的最早一天 → 昨天」，并把最近 3 天带上（报表会回填）。"""
-    target = date.today() - timedelta(days=1)
+def ingest_args(conn: sqlite3.Connection, market_day: str | None = None) -> tuple[list[str], str]:
+    """把 ingest 的起止日算成「缺的最早一天 → 昨天」，并把最近 3 天带上（报表会回填）。
+
+    「昨天」是**店铺日**的昨天，见 market_today()。由调用方把日子传进来，
+    不在这里自己取 —— 同一次判定里「今天是哪天」只能有一个来源。
+    """
+    if market_day:
+        target = date.fromisoformat(market_day) - timedelta(days=1)
+    else:
+        target = market_today(conn) - timedelta(days=1)
     cov = coverage(conn)
     missing = []
     for t, v in cov.items():
@@ -370,9 +507,13 @@ def ingest_args(conn: sqlite3.Connection) -> tuple[list[str], str]:
     return ["--start", start.isoformat(), "--end", target.isoformat()], f"{start}~{target}"
 
 
-def run_step(conn, step: str, model: str, today: str, force: bool) -> str:
-    """返回 ok | failed | skipped | blocked。"""
-    done, why = step_done(conn, step, today)
+def run_step(conn, step: str, model: str, today: str, force: bool,
+             market_day: str | None = None) -> str:
+    """返回 ok | failed | skipped | blocked。
+
+    today 是 CST 日（「今天做过没」），market_day 是店铺日（「站点那边哪一天过完了」）。
+    """
+    done, why = step_done(conn, step, today, market_day)
     if done and not force:
         say(f"· {step:9s} 跳过 —— {why}")
         record(conn, today, step, attempts_today(conn, step, today) + 1, "skipped", 0, now_iso(), why)
@@ -386,11 +527,11 @@ def run_step(conn, step: str, model: str, today: str, force: bool) -> str:
     cmd = build_cmd(step, model)
     note = ""
     if step == "ingest":
-        extra, window = ingest_args(conn)
+        extra, window = ingest_args(conn, market_day)
         cmd += extra
         note = f"窗口 {window}"
     if step == "market":
-        ds = market_datasets(conn, today)
+        ds = market_datasets(conn, market_day or today)
         cmd += ["--dataset", ",".join(ds)]
         note = f"数据集 {'+'.join(ds)}"
 
@@ -404,7 +545,12 @@ def run_step(conn, step: str, model: str, today: str, force: bool) -> str:
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         out, code = proc.stdout or "", proc.returncode
     except subprocess.TimeoutExpired as e:
-        out, code = (e.stdout or "") + f"\n[chain] 超时 {TIMEOUTS[step]}s，已中止", 124
+        # TimeoutExpired.stdout 在部分平台/版本上即使 text=True 也是 bytes，
+        # 直接和 str 相加会抛 TypeError，把「超时」变成「chain 自己崩掉」。
+        raw = e.stdout
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        out, code = (raw or "") + f"\n[chain] 超时 {TIMEOUTS[step]}s，已中止", 124
     dt = int(time.time() - t0)
 
     tail = "\n".join(out.strip().splitlines()[-12:])
@@ -412,7 +558,7 @@ def run_step(conn, step: str, model: str, today: str, force: bool) -> str:
         print(tail, flush=True)
 
     # 退出码不可尽信：ingest 在数据集全 FAIL 时也返回 0，所以再验一次真实状态
-    done2, why2 = step_done(conn, step, today)
+    done2, why2 = step_done(conn, step, today, market_day)
     ok = (code == 0) and done2
     status = "ok" if ok else "failed"
     detail = f"{why2}；耗时 {dt}s" + ("" if code == 0 else f"；exit={code}")
@@ -433,7 +579,17 @@ def main(argv: list[str]) -> int:
 
     conn = connect()
     ensure_schema(conn)
+    # 两个日期，两个用途，别混：
+    #   today      —— CST 日，问「今天这条链做过没」。chain_run.business_day、
+    #                 run_log.finished_at、agent_run.started_at 全是 CST 日；
+    #                 engine_run/memorial 是 UTC 日，step_done/_started_after
+    #                 已统一用 _ts() 转成本地 CST 日再比对。
+    #   market_day —— 店铺日（LA），只用于「站点那边哪一天已经过完」：
+    #                 ingest 的目标日、ABA 的周键。
+    # 2026-11-26 踩过：把 today 整体换成 LA 日，step_done 里 6 处
+    # substr(<CST/UTC 时间列>,1,10)=today 全部失配 → 整条链空转或反复重跑。
     today = date.today().isoformat()
+    market_day = market_today(conn).isoformat()
     # rank 排在 market 之后、engine 之前：engine 的 R31 卡位规则要读 rank_snapshot，
     # 排在 engine 后面等于让引擎读昨天的位次。
     #
@@ -445,9 +601,9 @@ def main(argv: list[str]) -> int:
                           "attribute", "converge"]
 
     if args.status:
-        print(f"库：{DB}\n今天：{today}\n")
+        print(f"库：{DB}\n今天（CST）：{today}   店铺日（{MARKET_ID} 号店）：{market_day}\n")
         for s in steps:
-            done, why = step_done(conn, s, today)
+            done, why = step_done(conn, s, today, market_day)
             fails = attempts_today(conn, s, today)
             print(f"  {s:9s} {'已完成' if done else '未完成':4s}  {why}"
                   + (f"  今天失败 {fails} 次" if fails else ""))
@@ -469,7 +625,8 @@ def main(argv: list[str]) -> int:
     if lock is None:
         return 0
 
-    say(f"日更链开始（库 {Path(DB).name}，业务日 D-1={(date.today() - timedelta(days=1)).isoformat()}）")
+    say(f"日更链开始（库 {Path(DB).name}，{MARKET_ID} 号店业务日 "
+        f"D-1={(market_today(conn) - timedelta(days=1)).isoformat()}，CST 今天 {today}）")
     if not net_ready():
         say("网络 5 分钟仍不可用，本轮放弃（30 分钟后 launchd 会再来）")
         record(conn, today, "ingest", attempts_today(conn, today, "ingest") + 1,
@@ -485,7 +642,7 @@ def main(argv: list[str]) -> int:
                    f"上游 {blocked_by} 未完成，本轮不跑")
             say(f"· {s:9s} 跳过 —— 上游 {blocked_by} 未完成")
             continue
-        st = run_step(conn, s, args.model, today, args.force)
+        st = run_step(conn, s, args.model, today, args.force, market_day)
         results[s] = st
         if st == "failed":
             blocked_by = s

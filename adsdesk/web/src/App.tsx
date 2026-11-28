@@ -7,14 +7,18 @@ import { EXPECT_API, get, getHealth, type Freshness } from './lib/api'
 
 type Tab = 'approval' | 'cockpit' | 'chat' | 'agent'
 
-const TABS: { key: Tab; label: string }[] = [
-  { key: 'approval', label: '审批台' },
-  { key: 'cockpit', label: '驾驶舱' },
-  { key: 'chat', label: '对话' },
-  { key: 'agent', label: 'Agent' },
+const PRIMARY_TABS: { key: Tab; label: string }[] = [
+  { key: 'approval', label: '今日一键台' },
+  { key: 'cockpit', label: '看板' },
+  { key: 'chat', label: '问账' },
 ]
 
-/** 允许用 ?tab=cockpit 直接打开某一页 —— 省得每次都点一下，也方便截图和分享链接。 */
+const ALL_TABS: { key: Tab; label: string }[] = [
+  ...PRIMARY_TABS,
+  { key: 'agent', label: '诊断与日志' },
+]
+
+/** 允许用 ?tab=cockpit 直接打开某一页 —— 保留各页直达链接兼容性。 */
 function initialTab(): Tab {
   const q = new URLSearchParams(window.location.search).get('tab')
   return q === 'cockpit' || q === 'chat' || q === 'agent' ? q : 'approval'
@@ -26,8 +30,6 @@ const POLL_MS = 60_000
 export default function App() {
   const [tab, setTab] = useState<Tab>(initialTab)
   const [fresh, setFresh] = useState<Freshness | null>(null)
-  // 后端可达性与接口版本：分开两个 state，因为处置方式不同
-  // （一个去启动服务，一个去重新 build），混成一个「出错了」等于没说。
   const [down, setDown] = useState<string | null>(null)
   const [apiVersion, setApiVersion] = useState<number | null>(null)
   const [signal, setSignal] = useState(0)
@@ -37,15 +39,11 @@ export default function App() {
       .then((f) => {
         setFresh(f)
         setDown(null)
-        // 每次新鲜度变化就让常驻页面重拉一次 —— 否则切回审批台看到的
-        // 还是挂载那一刻的数据，而 tab 常驻的代价正是「不会自动重载」。
         setSignal((n) => n + 1)
       })
       .catch((e: unknown) => setDown(e instanceof Error ? e.message : String(e)))
   }, [])
 
-  // 只在挂载时建一次轮询；tab 变化**不**触发请求（旧代码把两者写在同一个
-  // effect 里，每点一次 Tab 就多打一次 /meta/freshness）。
   useEffect(() => {
     getHealth()
       .then((h) => setApiVersion(h.api_version ?? null))
@@ -55,8 +53,6 @@ export default function App() {
     return () => window.clearInterval(t)
   }, [loadFresh])
 
-  // 切页写历史（pushState），并监听 popstate —— 这样浏览器后退键能回到上一页。
-  // 旧代码用 replaceState，后退直接退出站点：人被弹出去一次就不再敢用后退了。
   useEffect(() => {
     const onPop = () => setTab(initialTab())
     window.addEventListener('popstate', onPop)
@@ -71,8 +67,6 @@ export default function App() {
     })
   }, [])
 
-  // 数字键 1~4 切页。改价时手在键盘上，不该为了换页去摸鼠标。
-  // 输入框里打字不拦（否则备注里打「1」就跳页）。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return
@@ -80,9 +74,9 @@ export default function App() {
       const tag = el?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable) return
       const i = Number(e.key)
-      if (i >= 1 && i <= TABS.length) {
+      if (i >= 1 && i <= ALL_TABS.length) {
         e.preventDefault()
-        goto(TABS[i - 1].key)
+        goto(ALL_TABS[i - 1].key)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -95,10 +89,13 @@ export default function App() {
 
   return (
     <>
+      <div className="bg-grid" aria-hidden="true" />
+      <div className="bg-grain" aria-hidden="true" />
+
       <div className="topbar">
         <h1>广告工作台</h1>
         <nav>
-          {TABS.map((t, i) => (
+          {PRIMARY_TABS.map((t, i) => (
             <button
               key={t.key}
               className={tab === t.key ? 'on' : ''}
@@ -109,32 +106,34 @@ export default function App() {
               {t.key === 'approval' && (c?.proposed ?? 0) > 0 && (
                 <span className="nav-dot">{c?.proposed}</span>
               )}
-              {t.key === 'agent' && (c?.pending_policy ?? 0) > 0 && (
-                <span className="nav-dot">{c?.pending_policy}</span>
-              )}
             </button>
           ))}
         </nav>
+        <button
+          className={`nav-secondary ${tab === 'agent' ? 'on' : ''}`}
+          onClick={() => goto('agent')}
+          title="诊断与日志（按 4）"
+        >
+          诊断与日志
+        </button>
         <div className="grow" />
         {(c?.pending_policy ?? 0) > 0 && (
-          <button className="badge badge-btn" onClick={() => goto('agent')}>
+          <button
+            className="badge badge-btn"
+            onClick={() => goto('approval')}
+            title="前往今日一键台认领策略"
+          >
             {c?.pending_policy} 条策略待认领
-          </button>
-        )}
-        {(c?.open_objection ?? 0) > 0 && (
-          <button className="badge badge-btn" onClick={() => goto('agent')}>
-            {c?.open_objection} 条反对待兑现
           </button>
         )}
         {fresh && (
           <div className="badge">
             {fresh.last_memorial ? (
               <>
-                数据至 <b>{fresh.last_memorial.business_day}</b> · 奏折 run #
-                {fresh.last_run?.run_id ?? '—'}
+                数据至 <b>{fresh.last_memorial.business_day}</b>
               </>
             ) : (
-              '还没有奏折'
+              '暂无数据'
             )}
             {stale && <span className="warn-text"> · 数据变旧</span>}
           </div>
@@ -143,24 +142,18 @@ export default function App() {
 
       {down && (
         <div className="banner err">
-          连不上后端：{down} —— 先在 adsdesk/api 下
-          <span className="mono"> python3 -m uvicorn main:app --port 5273 </span>
-          再刷新。
+          连不上后端：{down} —— 请先启动 API 服务后刷新。
         </div>
       )}
       {versionMismatch && (
         <div className="banner warn">
-          前端要接口 v{EXPECT_API}，后端在 v{apiVersion}：两侧不同步。改完后端接口就
-          <span className="mono"> npm run build </span>
-          重建前端，改了前端就先重启后端。
+          前端需要接口 v{EXPECT_API}，后端当前为 v{apiVersion}：两侧版本不一致，请重建前端或重启后端。
         </div>
       )}
 
       <div className="wrap">
-        {/* 四个页面常驻挂载，用 hidden 切显隐：卸载会让聊天记录、滚动位置、
-            勾了一半的审批全部丢掉。代价是各自要能被 signal 唤醒重拉（见下）。 */}
         <div hidden={tab !== 'approval'}>
-          <Approval freshness={fresh} signal={signal} />
+          <Approval freshness={fresh} signal={signal} onRefreshFresh={loadFresh} />
         </div>
         <div hidden={tab !== 'cockpit'}>
           <Cockpit signal={signal} />

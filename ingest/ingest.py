@@ -24,6 +24,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from jijia_client import JijiaClient
 
@@ -460,10 +461,21 @@ def day_range(start: str, end: str) -> list[str]:
     return [(d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
 
 
-def resolve_day(token: str) -> str:
-    """支持 yesterday / today / -N 这类相对日期，其余按 YYYY-MM-DD 原样返回。"""
+def resolve_day(token: str, today: date | None = None) -> str:
+    """支持 yesterday / today / -N 这类相对日期，其余按 YYYY-MM-DD 原样返回。
+
+    `today` 必须由调用方按**店铺时区**算好再传（见 market_today）。
+    早先这里默认 `date.today()`，拿的是本机 CST 日期 —— 而 7 号店的
+    `dim_market.timezone` 是 `US/Pacific`，比 CST 慢 16 小时。
+    后果：北京时间 11-26 08:00 跑，CST 的「昨天」是 11-25，
+    而洛杉矶此刻还是 11-25 16:00，广告后台的 11-25 才过了 2/3，
+    `ads_report_period` 是 5（按周结算），当天数据根本没长完。
+    更糟的是 11-26 15:00 跑时，洛杉矶才 11-25 23:00 —— 依然在拉「当天」。
+    这不是精度问题：拉到的是一天的残值，而引擎/收敛器会把它当完整日。
+    """
     token = (token or "").strip().lower()
-    today = date.today()
+    if today is None:
+        today = date.today()
     if token in ("yesterday", "y"):
         return (today - timedelta(days=1)).isoformat()
     if token in ("today", "t"):
@@ -471,6 +483,36 @@ def resolve_day(token: str) -> str:
     if token.startswith("-") and token[1:].isdigit():
         return (today - timedelta(days=int(token[1:]))).isoformat()
     return token
+
+
+def market_today(conn: sqlite3.Connection, market_id: int) -> date:
+    """这个店铺「今天」是哪一天 —— 按 dim_market.timezone，不是按本机。
+
+    为什么必须按店铺：Amazon 的报表日是站点本地日。US/Pacific 与 CST 差 16 小时，
+    北京时间上午 8 点时洛杉矶还是前一天下午 4 点 —— 此时用 CST 的「昨天」
+    去拉，拿到的是洛杉矶**今天**的半天数据。
+
+    取不到时区时退回本机日期并打一行警告，而不是静默用错的值：
+    这个函数的返回值直接决定「拉哪几天」，静默错了要等几天后才在数据上显形。
+    """
+    row = None
+    try:
+        row = conn.execute(
+            "select timezone from dim_market where market_id=?", (market_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    tz = ((row["timezone"] if row else "") or "").strip()
+    if tz:
+        try:
+            return datetime.now(ZoneInfo(tz)).date()
+        except Exception as e:
+            print(f"  [时区] dim_market 里的 {tz!r} 用不了（{e}），退回本机日期", flush=True)
+    else:
+        print(f"  [时区] market {market_id} 没有 timezone，退回本机日期 "
+              f"{date.today()}（拉到的可能是站点本地半截日）", flush=True)
+    return date.today()
+
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -490,12 +532,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--markets-only", action="store_true")
     p.add_argument("--report", action="store_true")
     args = p.parse_args(argv)
-    args.start = resolve_day(args.start)
-    args.end = resolve_day(args.end)
-    # 显式给了区间就不覆盖（手工补拉时以手工为准）
-    if args.recheck_days and "--start" not in argv and "--end" not in argv:
-        args.start = resolve_day(f"-{args.recheck_days}")
+    # 相对日期必须按**店铺时区**算，不能按本机。
+    # 这里先解析成 None 占位，等 main() 连上库、读到 dim_market.timezone 之后再算 ——
+    # parse_args 拿不到 conn，硬在这里用 date.today() 就是原来那个 bug。
+    args._rel = (args.start, args.end)
+    args._argv = list(argv)
+    args.start = None
+    args.end = None
     return args
+
+
+def apply_dates(args, conn: sqlite3.Connection) -> None:
+    """把相对日期（yesterday / -N）落到具体日期上，基准是店铺时区的今天。"""
+    today = market_today(conn, args.market)
+    raw_start, raw_end = args._rel
+    args.start = resolve_day(raw_start, today=today)
+    args.end = resolve_day(raw_end, today=today)
+    # 显式给了区间就不覆盖（手工补拉时以手工为准）
+    if args.recheck_days and "--start" not in args._argv and "--end" not in args._argv:
+        args.start = resolve_day(f"-{args.recheck_days}", today=today)
 
 
 
@@ -523,6 +578,8 @@ def main(argv: list[str]) -> int:
         report(conn)
         return 0
 
+    # 先刷 dim_market 再算日期：时区是 refresh_markets 写进来的，
+    # 顺序反了就会拿上一次的时区（或空）算「昨天」。
     client = JijiaClient()
     if not args.markets_only:
         names = [n.strip() for n in args.datasets.split(",") if n.strip()]
@@ -532,6 +589,8 @@ def main(argv: list[str]) -> int:
             return 2
         print(f"刷新 dim_market ...", flush=True)
         print(f"  markets: {refresh_markets(conn, client)} 个", flush=True)
+        apply_dates(args, conn)
+        print(f"  日期窗口: {args.start} ~ {args.end}（按店铺时区）", flush=True)
         results = []
         for name in names:
             result = run_dataset(conn, client, name, args.market, args.start, args.end)
@@ -543,7 +602,9 @@ def main(argv: list[str]) -> int:
                   + (f" note={result['note']}" if result.get("note") else ""), flush=True)
     else:
         results = []
+        # 同样先刷 market 再算日期：时区是 refresh_markets 写进 dim_market 的
         print(f"markets: {refresh_markets(conn, client)} 个")
+        apply_dates(args, conn)
 
     report(conn)
     if results:

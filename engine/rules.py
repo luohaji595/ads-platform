@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from facts import (Facts, DEFAULT_TARGET_ACOS, RANK_SNAPSHOT_MAX_AGE_HOURS,
@@ -28,6 +28,23 @@ BID_STEP_MAX = 0.20          # 单次 bid 变更幅度上限（IvyeaOps guardrai
 BID_TICK = 0.01              # Amazon 最小 bid 步长
 COOLDOWN_HOURS_BID = 72      # 同一对象 72 小时内不重复改 bid
 EXPIRY_HOURS = 72            # 建议 72 小时未处理自动过期
+
+# 受冷却期约束的动作：会真的改动广告后台的那些。
+# observe / alert 不在里面 —— 它们不改任何配置，被冷却拦掉只是让人少看一条信息。
+#
+# 名单里每个动作都必须**同时**有写侧（出建议时 `cooldown_until=_cooldown()`）
+# 和读侧（本文件里的 `if action in COOLDOWN_ACTIONS:` 门控）。
+# 只列名字不落实，比不列更坏 —— 读代码的人会以为频控在。
+# 2026-11-26 补齐：R08 raise_budget 与 R09 adjust_placement 原来只有名字，
+# 写侧从不写、读侧也没有门控，实测生产库 16 条这类决策全是 cooldown_until=NULL。
+# 对不上的：pause_candidate / add_negative 由 R01/R02 出，走同一条 R01 门控；
+# raise_bid 由 R03 出，R03 自己门控。
+COOLDOWN_ACTIONS = frozenset({
+    "reduce_bid", "floor_breach", "raise_bid", "raise_budget",
+    "adjust_placement", "pause_candidate", "add_negative",
+    # R31 卡位：加价 / 到位后降价，都是真的改 bid
+    "rank_push", "rank_step_down",
+})
 
 
 # ---------------------------------------------------------------- 数据结构
@@ -153,8 +170,19 @@ def _evidence(clicks: int, orders: int, baseline_cvr: float,
     return sig
 
 
+CST = timezone(timedelta(hours=8))
+
+
 def _now() -> datetime:
-    return datetime.now()
+    """带时区的本地时间。
+
+    原来返回 naive `datetime.now()`，落库是 `2026-11-19T14:17:11`（没有后缀），
+    而 `approve.py` 写 executed_at 用的是 `+08:00`，同一个 decision_log 表里
+    两种格式混着 —— 字符串直比会差 8 小时，跨时区一改就全错。
+    现在统一成 CST aware，`isoformat()` 天然带 `+08:00`；老行（naive）由
+    `facts.parse_ts()` 按 CST 解释，读侧兼容。
+    """
+    return datetime.now(CST)
 
 
 def _expires() -> str:
@@ -727,6 +755,18 @@ def rule_01_reduce_bid(f: Facts) -> RuleResult:
         else:
             action = "reduce_bid"
 
+        # ---- 冷却期：72 小时内已执行过 bid 变更的词，别再来第二刀。
+        # 只拦「会改动后台」的动作 —— observe / alert 不改任何东西，
+        # 拦掉只会让主人少看到一条「我看到了，先不动」。
+        if action in COOLDOWN_ACTIONS:
+            _cd = f.in_cooldown("keyword", kw["keyword_id"])
+            if _cd:
+                res.suppress("R01", kw["keyword_text"], "冷却期内",
+                             {"keyword_id": kw["keyword_id"], "cooldown_until": _cd,
+                              "note": f"该词 72 小时内已执行过 bid 变更，"
+                                      f"冷却到 {_cd} 再谈"})
+                continue
+
         if action == "pause_candidate":
             # 停用省下的是全窗口花费，跟 bid 有没有在约束成交无关
             saving = cost
@@ -843,7 +883,7 @@ def rule_01_reduce_bid(f: Facts) -> RuleResult:
             },
             rationale="；".join(rationale_parts),
             spend_impact=round(saving, 2),
-            cooldown_until=_cooldown() if action in ("reduce_bid", "floor_breach") else None,
+            cooldown_until=_cooldown() if action in COOLDOWN_ACTIONS else None,
             expires_at=_expires(),
         ))
 
@@ -886,6 +926,10 @@ def rule_03_scale_up(f: Facts) -> RuleResult:
                          {"keyword_id": kw["keyword_id"],
                           "note": "该词出价由 R31 卡位驱动，R03 不再叠加加价"})
             continue
+
+        # ---- 冷却期：72 小时内已执行过 bid 变更的词，加价也要让路
+        # 判定放在 budget_blocked 之后：预算打满时这条本来就只是提示，
+        # 不带冷却（见写入侧 `cooldown_until=_cooldown() if not budget_blocked`）。
 
         cvr = kw["cvr"] or 0
         # 闸门 2：自身 CVR 必须过盈亏平衡线
@@ -972,6 +1016,17 @@ def rule_03_scale_up(f: Facts) -> RuleResult:
                 f"加价不会带来更多量，只会让同样的钱买更少的点击。"
                 f"应先做 R08 加预算，再做这条。"
             )
+
+        # ---- 冷却期：72 小时内已执行过 bid 变更的词，别再加价。
+        # 预算打满的那条（raise_bid_blocked）不带冷却 —— 它只是提示「先去加预算」。
+        if not budget_blocked:
+            _cd = f.in_cooldown("keyword", kw["keyword_id"])
+            if _cd:
+                res.suppress("R03", kw["keyword_text"], "冷却期内",
+                             {"keyword_id": kw["keyword_id"], "cooldown_until": _cd,
+                              "note": f"该词 72 小时内已执行过 bid 变更，"
+                                      f"冷却到 {_cd} 再谈"})
+                continue
 
         res.decisions.append(Decision(
             rule_id="R03",
@@ -1101,13 +1156,26 @@ def rule_02_negative_candidates(f: Facts) -> RuleResult:
         # 如果这条搜索词来自自动活动，否词应该否在自动活动上
         is_auto_source = False
 
+        # ---- 冷却期：这个搜索词 72 小时内已经否过一次，别重复否。
+        # 判定放在 action 定下来之后：conf != high 时出的是 observe，
+        # 不动后台，不该被冷却拦（同 R01/R09 的取舍）。
+        _action = "add_negative" if conf == "high" else "observe"
+        if _action in COOLDOWN_ACTIONS:
+            _cd = f.in_cooldown("search_term", term)
+            if _cd:
+                res.suppress("R02", a["term"], "冷却期内",
+                             {"search_term": term, "cooldown_until": _cd,
+                              "note": f"该搜索词 72 小时内已执行过否词，"
+                                      f"冷却到 {_cd} 再谈"})
+                continue
+
         res.decisions.append(Decision(
             rule_id="R02",
             rule_version=RULE_VERSION,
             entity_type="search_term",
             entity_id=term,
             entity_label=a["term"],
-            action_type="add_negative" if conf == "high" else "observe",
+            action_type=_action,
             current_value=None,
             proposed_value="negative_exact",
             confidence=conf,
@@ -1163,6 +1231,9 @@ def rule_02_negative_candidates(f: Facts) -> RuleResult:
                         f"只能列为候选，建议先降 bid 观察而不是直接否。")
             ),
             spend_impact=round(a["cost"], 2) if conf != "low" else 0.0,
+            # 否词也在 COOLDOWN_ACTIONS 里（add_negative），写侧必须跟上，
+            # 否则「读侧会拦、写侧不写」又制造一处永远不生效的频控。
+            cooldown_until=_cooldown() if conf == "high" else None,
             expires_at=_expires(),
         ))
 
@@ -1296,6 +1367,23 @@ def rule_08_budget(f: Facts, util_threshold: float = 0.85) -> RuleResult:
             })
             continue
 
+        # ---- 冷却期：72 小时内已经执行过预算调整的活动，别再来第二刀。
+        #
+        # 这里以前是空的 —— COOLDOWN_ACTIONS 里列了 raise_budget，读侧也会拦，
+        # 但写侧从来不写 cooldown_until，于是这条频控从未生效过一次。
+        # 实测（2026-11-26）生产库 6 条 raise_budget 决策全是 cooldown_until=NULL。
+        # 「声明了受管、实际没人管」比「没声明」更坏：读代码的人会以为它在。
+        #
+        # 位置必须在证据判定之后：先确认这条建议本身成立，再说「成立但现在不做」。
+        # 反过来会把「证据不足」说成「冷却期内」，那是两件不同的事。
+        _cd = f.in_cooldown("campaign", c["campaign_id"])
+        if _cd:
+            res.suppress("R08", c["campaign_name"], "冷却期内",
+                         {"campaign_id": c["campaign_id"], "cooldown_until": _cd,
+                          "note": f"这个活动 72 小时内已执行过预算调整，"
+                                  f"冷却到 {_cd} 再谈"})
+            continue
+
         old = c["daily_budget"]
         # 步长来自 facts：被 param_override(max_budget_step) 覆盖过就是覆盖值。
         # 「加，但幅度再小一点」这条钩子若不落到这里，就只是句客气话。
@@ -1359,6 +1447,7 @@ def rule_08_budget(f: Facts, util_threshold: float = 0.85) -> RuleResult:
                 f"**这个活动是被预算卡住，不是被市场卡住** —— 加预算是当前性价比最高的动作。"
             ),
             spend_impact=round(-(new - old) * f.window_days, 2),   # 负 = 多花
+            cooldown_until=_cooldown(),
             expires_at=_expires(),
         ))
     return res
@@ -1484,6 +1573,25 @@ def rule_09_placement(f: Facts) -> RuleResult:
                    else "只到「证据一般」，加位次是花钱动作，不到「证据够」不放行，先观察）")
             )
 
+        # ---- 冷却期：72 小时内已经改过这个「活动 × 位次」的加价，别再来第二刀。
+        #
+        # 与 R08 同一个缺口：COOLDOWN_ACTIONS 里列了 adjust_placement，读侧会拦，
+        # 但写侧从来没写过 cooldown_until —— 实测生产库 10 条 adjust_placement
+        # 决策全是 NULL。位次加价一次动 20 个点、要看 7 天，三天内重复调等于
+        # 把观察期作废。
+        #
+        # 位置在 observe 降级之后：observe 不改后台，不该被冷却拦；
+        # 而且降级成 observe 之后 action 已变，用最终 action 判断才对。
+        if action in COOLDOWN_ACTIONS:
+            _cd = f.in_cooldown("campaign_placement", f"{cid}::{cp['placement']}")
+            if _cd:
+                res.suppress("R09", label, "冷却期内",
+                             {"campaign_id": cid, "placement": cp["placement"],
+                              "cooldown_until": _cd,
+                              "note": f"这个位次 72 小时内已调过加价，"
+                                      f"冷却到 {_cd} 再谈"})
+                continue
+
         res.decisions.append(Decision(
             rule_id="R09",
             rule_version=RULE_VERSION,
@@ -1536,6 +1644,7 @@ def rule_09_placement(f: Facts) -> RuleResult:
             },
             rationale=rationale,
             spend_impact=impact,
+            cooldown_until=_cooldown() if action in COOLDOWN_ACTIONS else None,
             expires_at=_expires(),
         ))
     return res
@@ -1667,6 +1776,11 @@ def rule_31_rank_position_push(f: Facts) -> RuleResult:
         orders = kw["orders"]
         acos = kw["acos"]
 
+        # ---- 冷却期：72 小时内已执行过 bid 变更的词，卡位也不动它。
+        # 判定点放在「确实要出动作」的两处（降价 / 加价）之前，而不是循环开头 ——
+        # 否则「已在目标位」会被误报成「冷却期内」，把没改的原因说错。
+        _cd = f.in_cooldown("keyword", kid)
+
         # ---- 阀零二：排名观测缺失/过期，宁可不动
         if not st.get("observations"):
             res.suppress("R31", label, "无排名观测",
@@ -1739,6 +1853,12 @@ def rule_31_rank_position_push(f: Facts) -> RuleResult:
                         res.suppress("R31", label, "空转",
                                      {"bid": cur, "computed": new,
                                       "note": "降价幅度小于 0.01，改了等于没改"})
+                        continue
+                    if _cd:
+                        res.suppress("R31", label, "冷却期内",
+                                     {"keyword_id": kid, "cooldown_until": _cd,
+                                      "note": f"该词 72 小时内已执行过 bid 变更，"
+                                              f"冷却到 {_cd} 再谈"})
                         continue
                     res.decisions.append(Decision(
                         rule_id="R31",
@@ -1884,6 +2004,13 @@ def rule_31_rank_position_push(f: Facts) -> RuleResult:
             # 加价导致的额外花费 ≈ 窗口花费 × 涨幅（粗估，报告里标估算）
             extra = round(cost * (new / cur - 1), 2)
 
+        if _cd:
+            res.suppress("R31", label, "冷却期内",
+                         {"keyword_id": kid, "cooldown_until": _cd,
+                          "note": f"该词 72 小时内已执行过 bid 变更，"
+                                  f"冷却到 {_cd} 再谈"})
+            continue
+
         res.decisions.append(Decision(
             rule_id="R31",
             rule_version=RULE_VERSION,
@@ -1996,6 +2123,17 @@ def rule_32_stop_loss(f: Facts) -> RuleResult:
 
     acct_clicks = f.account.get("clicks") or 0
     for kw in cc["keywords"]:
+        # ---- 冷却期：这个词 72 小时内已经停过一次了，别再来第二刀。
+        # 位置在循环开头是有意的：R32 整条规则只出一种动作（pause_candidate），
+        # 没有 observe/alert 分支，不存在「把不改后台的动作也拦掉」的风险。
+        # 停投是这几条规则里最重的一刀（14 天归因窗口），重复提最没意义。
+        _cd = f.in_cooldown("keyword", kw["keyword_id"])
+        if _cd:
+            res.suppress("R32", kw["keyword_text"], "冷却期内",
+                         {"keyword_id": kw["keyword_id"], "cooldown_until": _cd,
+                          "note": f"该词 72 小时内已执行过停投/降 bid，"
+                                  f"冷却到 {_cd} 再谈"})
+            continue
         share = (kw["clicks"] / acct_clicks) if acct_clicks else None
         # 停掉这个词省下的是全窗口花费；代价是这些点击带来的流量与可能的单。
         # 两个数都要说：只说省多少会让主人以为免费。
@@ -2110,6 +2248,7 @@ def rule_32_stop_loss(f: Facts) -> RuleResult:
             },
             rationale=rationale + followed + honest + cost_side + options,
             spend_impact=kw["cost"],
+            cooldown_until=_cooldown(),
             expires_at=_expires(),
         ))
     return res

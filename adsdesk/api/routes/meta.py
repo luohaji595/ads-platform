@@ -93,8 +93,13 @@ def freshness():
         except sqlite3.Error:
             pending_policy = 0
         try:
+            # 口径是 outcome，不是 verdict。
+            # verdict 是 agent 表态（oppose/doubt，NOT NULL，写入时就有值），
+            # outcome 才是「事后兑现没兑现」（pending/correct/wrong/unverifiable）。
+            # 早先这里查 verdict is null，永远命中 0 行 —— 40 条待兑现的反对
+            # 在顶栏上是隐形的，人根本不知道还有账没算。
             open_objection = conn.execute(
-                "select count(*) as n from agent_objection where verdict is null or verdict=''"
+                "select count(*) as n from agent_objection where outcome='pending'"
             ).fetchone()["n"]
         except sqlite3.Error:
             open_objection = 0

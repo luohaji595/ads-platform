@@ -12,13 +12,23 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 -- ------------------------------------------------------------
--- 1. 配置快照：每天一份，用于 diff 出"谁改了什么"
+-- 1. 配置快照：每次观测一份，用于 diff 出"谁改了什么"
 --    bid / daily_budget / state 这些字段在积加报表里是快照值，
 --    只有每天拉一次、逐日对比，才能得到真实的变更历史。
+--
+--    这里的结构必须和 snapshot.ensure_snapshot_schema() 迁移出来的结构
+--    **完全一致**（12 列 + 6 列主键）。原来这里写的是旧结构（无 snap_ts、
+--    主键 4 列），全新库第一次 take_snapshot 会先被 ensure_snapshot_schema
+--    当成"老库"迁移一遍；迁移分支一旦漏改主键，INSERT 的
+--    ON CONFLICT(...market_id...) 就对不上唯一约束，直接
+--    `OperationalError: ON CONFLICT clause does not match any PRIMARY KEY`。
+--    2026-11-26 实测复现过，别再把两处结构分开维护。
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS config_snapshot (
-    snap_date     TEXT    NOT NULL,          -- 观测日（不是报表日）
-    entity_type   TEXT    NOT NULL,          -- keyword | campaign | adgroup | target
+    snap_ts       TEXT    NOT NULL,          -- 观测时刻（UTC ...Z）——真正的身份
+    snap_date     TEXT    NOT NULL,          -- 这批配置取自哪一天的报表行
+    legacy        INTEGER NOT NULL DEFAULT 0,-- 1 = 迁移前的旧行，只有日期粒度
+    entity_type   TEXT    NOT NULL,          -- keyword | campaign | placement
     entity_id     TEXT    NOT NULL,
     market_id     INTEGER,
     campaign_id   TEXT,
@@ -27,9 +37,10 @@ CREATE TABLE IF NOT EXISTS config_snapshot (
     field         TEXT    NOT NULL,          -- bid | daily_budget | state | placement_tos | placement_pp | placement_ros
     value         TEXT,
     captured_at   TEXT    NOT NULL,
-    PRIMARY KEY (snap_date, entity_type, entity_id, field)
+    PRIMARY KEY (snap_ts, snap_date, entity_type, entity_id, market_id, field)
 );
 CREATE INDEX IF NOT EXISTS ix_snap_entity ON config_snapshot(entity_type, entity_id, snap_date);
+CREATE INDEX IF NOT EXISTS ix_snap_ts ON config_snapshot(snap_ts);
 
 -- ------------------------------------------------------------
 -- 2. 变更事件：由 config_snapshot 两两 diff 自动生成，零人工录入

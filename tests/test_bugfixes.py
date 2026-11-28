@@ -113,7 +113,8 @@ class ApproveStateMachineTest(unittest.TestCase):
                 confidence real, spend_impact real, rationale text, ticket_id text,
                 gate_reason text, override_by text, override_reason text,
                 overridden_at text, executed_at text, executed_by text,
-                executed_value text, attribution_due_at text, outcome_filled_at text);
+                executed_value text, attribution_due_at text, outcome_filled_at text,
+                cooldown_until text, expires_at text);
             create table exec_order(
                 order_id text primary key, decision_id integer, status text);
             create table exec_order_item(
@@ -301,6 +302,126 @@ class ChainMidshipTest(unittest.TestCase):
         done, why = chain.step_done(conn, "midship", today)
         self.assertTrue(done, why)
         self.assertIn("18:04:20", why)
+
+
+# ------------------------------------------------------------------ Fix7 qkey 剥离
+
+class QuestionQkeyTest(unittest.TestCase):
+    """前端用 qkey（如 Q01#2）定位同号题，落库必须用裸题号（Q01）。
+
+    修之前：approve.answer_question 用 qkey 定位出 q 后，仍把带 #N 的 body.question_id
+    原样传给 reason_routes.assume / apply_answer / exclude 与 reason_hit.scope，
+    导致 agent_assumption.question_code='Q01#2'，收敛器 _REFUTE_ON 查不到并判 unverifiable。
+    """
+
+    def setUp(self):
+        from adsdesk.api.routes import approve
+        from adsdesk.api import models
+        self.approve = approve
+        self.models = models
+
+    def _mem(self):
+        import json
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            create table memorial(run_id integer primary key, pack_json text);
+            create table policy(
+                policy_id integer primary key autoincrement,
+                scope text, object_id text, policy_type text, params_json text,
+                source text, evidence_text text, status text, created_at text,
+                expires_at text, reviewed_at text);
+            create table reason_hit(
+                hit_id integer primary key autoincrement,
+                object_id text, reason_code text, scope text, evidence_text text,
+                created_at text, answer_type text, decision_id integer);
+            create table reason_excluded(
+                excluded_id integer primary key autoincrement,
+                object_id text, reason_code text, created_at text, expires_at text);
+            create table agent_assumption(
+                assumption_id integer primary key autoincrement,
+                object_id text, question_code text, default_action text,
+                created_at text, review_at text, result text);
+        """)
+        pack = {
+            "questions": [
+                {
+                    "id": "Q01",
+                    "qkey": "Q01#1",
+                    "object": "kw-1",
+                    "options": ["允许暂停", "其他"],
+                    "reason_codes": ["kw_mismatch_ok_to_pause", "kw_other"],
+                    "option_meta": [
+                        {"reason_code": "kw_mismatch_ok_to_pause", "policy_type": "allow_pause_no_orders"},
+                        {"reason_code": "kw_other"},
+                    ],
+                },
+                {
+                    "id": "Q01",
+                    "qkey": "Q01#2",
+                    "object": "kw-2",
+                    "options": ["允许暂停", "其他"],
+                    "reason_codes": ["kw_mismatch_ok_to_pause", "kw_other"],
+                    "option_meta": [
+                        {"reason_code": "kw_mismatch_ok_to_pause", "policy_type": "allow_pause_no_orders"},
+                        {"reason_code": "kw_other"},
+                    ],
+                },
+            ]
+        }
+        conn.execute("insert into memorial values(10, ?)", (json.dumps(pack),))
+        conn.commit()
+        return conn
+
+    def test_skip_with_qkey_writes_bare_question_code(self):
+        conn = self._mem()
+        body = self.models.QuestionAnswerIn(
+            question_id="Q01#2", run_id=10, selected=[], skipped=True,
+        )
+
+        @__import__("contextlib").contextmanager
+        def fake_write_conn():
+            yield conn
+
+        with mock.patch.object(self.approve, "write_conn", fake_write_conn):
+            res = self.approve.answer_question(body)
+
+        self.assertEqual(res.detail["question_id"], "Q01#2", "HTTP 回执保持原 qkey 契约")
+        row = conn.execute("select object_id, question_code from agent_assumption").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["object_id"], "kw-2")
+        self.assertEqual(row["question_code"], "Q01", "落库必须剥离 #2，保留裸题号")
+
+    def test_answer_and_exclude_with_qkey_write_bare_question_id(self):
+        import json
+        conn = self._mem()
+        body = self.models.QuestionAnswerIn(
+            question_id="Q01#2", run_id=10, selected=[0], excluded=[1],
+            free_text="词不匹配", skipped=False,
+        )
+
+        @__import__("contextlib").contextmanager
+        def fake_write_conn():
+            yield conn
+
+        with mock.patch.object(self.approve, "write_conn", fake_write_conn):
+            res = self.approve.answer_question(body)
+
+        self.assertEqual(res.detail["question_id"], "Q01#2")
+        hit = conn.execute("select object_id, scope from reason_hit").fetchone()
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["object_id"], "kw-2")
+        self.assertEqual(hit["scope"], "Q01")
+
+        pol = conn.execute("select object_id, source, params_json from policy").fetchone()
+        self.assertIsNotNone(pol)
+        self.assertEqual(pol["object_id"], "kw-2")
+        self.assertIn("#Q01@run10", pol["source"])
+        self.assertEqual(json.loads(pol["params_json"])["question_id"], "Q01")
+
+        exc_sed = [s for s in res.detail["sediment"] if s.get("table") == "reason_excluded"]
+        self.assertEqual(len(exc_sed), 1)
+        self.assertEqual(exc_sed[0]["question_id"], "Q01")
 
 
 if __name__ == "__main__":

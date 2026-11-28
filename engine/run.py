@@ -27,7 +27,7 @@ import os
 import sqlite3
 import sys
 import datetime as _dt
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import facts
 import reason_routes
@@ -172,18 +172,25 @@ def save_decisions(conn, run_id: int, decisions) -> dict:
             _ctx["revisions"] = int((_old or {}).get("revisions") or 1) + 1
             _ctx["last_run_id"] = run_id
             # 刷新：内容换新，身份（decision_id / decided_at）不动。
+            #
+            # cooldown_until 必须一起刷新。原来这条 UPDATE 的 SET 子句里没有它，
+            # 于是只有「第一次 INSERT」才写得进冷却期；之后每次复用都把提案行上的
+            # 冷却时间原样留在库里。而 `adsdesk/api/routes/approve.py` 的 mark_executed
+            # 是拿「这行有没有 cooldown_until」判断「这类动作受不受频控管」的 ——
+            # 复用路径一旦把新值丢掉，那条判据就永远为假，冷却永不生效。
             conn.execute(
                 """UPDATE decision_log SET
                        run_id=?, current_value=?, proposed_value=?, confidence=?,
                        context_json=?, calculation_json=?, significance_json=?,
-                       rationale=?, spend_impact=?, expires_at=?, gate_reason=?
+                       rationale=?, spend_impact=?, expires_at=?, gate_reason=?,
+                       cooldown_until=?
                    WHERE decision_id=?""",
                 (run_id,
                  row.get("current_value"), row.get("proposed_value"), row.get("confidence"),
                  json.dumps(_ctx, ensure_ascii=False, default=str),
                  row.get("calculation_json"), row.get("significance_json"),
                  row.get("rationale"), row.get("spend_impact"), row.get("expires_at"),
-                 row.get("gate_reason"), live["decision_id"]),
+                 row.get("gate_reason"), row.get("cooldown_until"), live["decision_id"]),
             )
             d.decision_id = live["decision_id"]
             ids[key] = live["decision_id"]
@@ -213,7 +220,9 @@ def _expire_stale_proposals(conn, run_id: int) -> int:
     run #114 的 pack 里 front/observing/alerts 三处都没有它）就是这么活下来的。
     现在改成比完整时间戳：只要 expires_at 已经过去就收。
     """
-    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    # 与 rules._now() 同一口径（CST aware，带 +08:00），否则新写的 expires_at
+    # 与这里比较用的 now 一个带后缀一个不带，字符串直比会漏掉「刚刚过期」的行。
+    now = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
     cur = conn.execute(
         """UPDATE decision_log
               SET status='expired',
@@ -469,6 +478,44 @@ def save_observing(conn, run_id: int, pack) -> dict:
 
     pack.observing = [d for d in pack.observing if handle(d)]
     pack.below = [d for d in pack.below if handle(d)]
+    # 收掉「上一轮观察、这一轮不再出现」的僵尸行。
+    #
+    # observing 是状态不是事件，_upsert_observing 故意跨 run 复用同一行，所以它
+    # 从来不被 _expire_stale_proposals 收（那条 SQL 只认 status='proposed'）。
+    # 一旦某个对象这轮不再落进 pack.observing / pack.below（它有了决策、掉出范围、
+    # 或换了四元组），那行就变成：不在奏折里、approve.py 的强制批准拿不到 id
+    # （人只有从 pack 里才看得到 decision_id）、v_open_decisions 也不含 observing。
+    # 结果是它永不结算、也永不消失，还占着 (rule_id, entity_type, entity_id,
+    # action_type) 让 _upsert_observing 一直复用同一行。2026-11-26 实测：
+    # 库里 observing 有 154/155/156/173/174/207/227 七条，run #123 的 pack 里只有
+    # 155/174/226/227 —— 差集 154/156/173/207 就是四条看不见的僵尸。
+    #
+    # 判据用「本轮出现过没有」（decision_id 白名单），不用 expires_at：observing 行的
+    # expires_at 是首次写入时的值、之后从不更新（#155 的 decided_at 是 11-26、
+    # expires_at 还是 11-22），拿它判会把正在用的 155/174 一起收掉。
+    # 也不用 run_id：held（观察期内已批「先观察」）本轮在 pack 里出现但不落库，
+    # 它的 run_id 停在旧 run 上，按 run_id 判会把这些「人已经批过的」误收成过期。
+    #
+    # 只在**本轮确实写了观察行**时才扫：一轮零条 observing，更可能是数据没追平
+    # 或规则集体没跑到，而不是「全都解决了」。那种时候把整张表扫成 expired，
+    # 正是我们一直在修的那种静默伤害。
+    seen_ids = [d.decision_id for d in (list(pack.observing) + list(pack.below))
+                if getattr(d, "decision_id", None)]
+    swept = 0
+    if stat["inserted"] + stat["reused"] > 0 and seen_ids:
+        marks = ", ".join("?" * len(seen_ids))
+        cur = conn.execute(
+            f"""UPDATE decision_log
+                   SET status='expired',
+                       reject_reason='观察区里已经不再出现了（不是否决）',
+                       reject_reason_code='observe_dropped'
+                 WHERE status='observing'
+                   AND decision_id NOT IN ({marks})""",
+            tuple(seen_ids),
+        )
+        swept = cur.rowcount or 0
+        if swept:
+            print(f"[账本] {swept} 条观察行本轮已不再出现，置 expired（不是否决）", flush=True)
     conn.commit()
     if stat["settled"]:
         pack.notes.append(f"另有 {stat['settled']} 条不够线的对象已在账本里表过态，不再重复列出。")
@@ -623,21 +670,37 @@ def main(argv=None) -> int:
     # 2) 事实层
     # 先把打钩沉淀下来的参数覆盖读出来：主人说过「目标放宽到 X」「加预算幅度小一点」，
     # 若不在这一层生效，那些钩子就只是躺在表里的一条记录，回路仍然是断的。
+    #
+    # 读侧也要卡区间（不是只有写侧卡）：库里可能已经有历史脏值 ——
+    # 老版本把「2 周后放到 40%」写成过 0.02，把「放宽到 500%」写成过 5.0。
+    # 写侧修好只保证以后不写坏，已经坏掉的必须靠这里兜住。
     _ov = reason_routes.overrides(conn, scope.SCOPE_ASIN)
     _target = args.target_acos
     _raw = _ov.get("target_acos")
     if _raw not in (None, ""):
         try:
-            _target = float(_raw)
+            _v = reason_routes._clamp("target_acos", float(_raw))
         except (TypeError, ValueError):
+            _v = None
             say(f"[沉淀] target_acos 覆盖值不是数字（{_raw!r}），按命令行默认值算")
+        if _v is None:
+            say(f"[沉淀] target_acos 覆盖值 {_raw!r} 超出可接受区间 "
+                f"{reason_routes.PARAM_BOUNDS['target_acos']}，忽略（按命令行默认值算）")
+        else:
+            _target = _v
     _step = facts.DEFAULT_BUDGET_STEP
     _raw = _ov.get("max_budget_step")
     if _raw not in (None, ""):
         try:
-            _step = float(_raw)
+            _v = reason_routes._clamp("max_budget_step", float(_raw))
         except (TypeError, ValueError):
+            _v = None
             say(f"[沉淀] max_budget_step 覆盖值不是数字（{_raw!r}），按默认 ×1.2 算")
+        if _v is None:
+            say(f"[沉淀] max_budget_step 覆盖值 {_raw!r} 超出可接受区间 "
+                f"{reason_routes.PARAM_BOUNDS['max_budget_step']}，忽略（按默认 ×1.2 算）")
+        else:
+            _step = _v
     if _target != args.target_acos or _step != facts.DEFAULT_BUDGET_STEP:
         say(f"[沉淀] 参数覆盖生效：目标 ACOS {report._pct(args.target_acos)} → "
             f"{report._pct(_target)}；加预算步长 ×{_step}")
@@ -745,16 +808,24 @@ def main(argv=None) -> int:
             + (f"，{obs_stat['settled']} 条你已表过态、不再重复列出" if obs_stat["settled"] else ""))
 
     # 5) 奏折
+    #
+    # --dry-run 不许覆盖真奏折。文件名只由 f.end 决定，而 f.end 是「业务窗口末」——
+    # 同一个业务日重跑就落到同一个路径。2026-11-26 实测踩到：用 --dry-run 复算
+    # 11-23 那轮，把 2026-11-23-奏折.md/.json 原地覆盖了（原文件是 01:39 真跑写的），
+    # 而这两个文件正是给人看的交付物、也是 memorial 里 report_path 指向的东西。
+    # 更麻烦的是 dry-run 下 run_id 是 None，覆盖后连「这是哪一轮」都看不出来。
+    # 所以 dry-run 一律加 .dryrun 后缀：能看、能 diff，但碰不到真文件。
     os.makedirs(REPORTS, exist_ok=True)
+    suffix = ".dryrun" if args.dry_run else ""
     md = report.render_report(f, res, run_id, snap_info, diff_info, pack=pack)
-    path = os.path.join(REPORTS, f"{f.end}-奏折.md")
+    path = os.path.join(REPORTS, f"{f.end}-奏折{suffix}.md")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(md)
     payload = report.pack_json(f, pack, run_id, suppressed=res.suppressed)
-    pack_path = os.path.join(REPORTS, f"{f.end}-奏折.json")
+    pack_path = os.path.join(REPORTS, f"{f.end}-奏折{suffix}.json")
     with open(pack_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
-    say(f"[报告] {path}")
+    say(f"[报告] {path}" + ("（dry-run，未覆盖真奏折）" if args.dry_run else ""))
 
     if not args.dry_run:
         # 落 memorial：工作台与 agent 都读这张表，不读文件

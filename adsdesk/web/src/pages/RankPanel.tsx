@@ -62,8 +62,6 @@ export type RankPanelData = {
  *  所以面板上要能一眼看出「这个数字是旧的」，而不是等引擎静默抑制。 */
 const MAX_AGE_HOURS = 6
 
-const EMPTY_HINT = '位次快照还没采集，先跑 `python3 ingest/rank.py --dataset snapshot`'
-
 function num(v: number | null | undefined): string {
   return v == null ? '—' : String(v)
 }
@@ -119,136 +117,145 @@ export default function RankPanel({ data }: { data: RankPanelData | null }) {
   const summary = data?.summary ?? { n_targets: 0, n_have_data: 0, n_on_goal: 0 }
   const note = data?.note ?? null
 
-  // 三态分开说，别把「表没建」「没采到」「采到了但没对上目标」混成一句：
-  // 三种情况的下一步动作完全不同（migrate / 跑 snapshot / 查 keyword_id 口径）。
   if (!data) {
     return (
-      <div className="card">
-        <h2>
-          位次卡位<span className="sub">读取中…</span>
-        </h2>
-        <div className="note">读取中…</div>
-      </div>
+      <details className="disclosure">
+        <summary>
+          位次卡位
+          <span className="disclosure-sub">读取中…</span>
+        </summary>
+        <div className="drawer-box">
+          <div className="note">读取中…</div>
+        </div>
+      </details>
     )
   }
 
   if (targets.length === 0) {
     return (
-      <div className="card">
-        <h2>
-          位次卡位<span className="sub">暂无位次数据</span>
-        </h2>
-        <div className="note">
-          {note || EMPTY_HINT}
-          <div className="small muted" style={{ marginTop: 6 }}>
-            先种卡位目标再采位次：`python3 ingest/rank.py --dataset target-seed` →
-            `--dataset snapshot`（两个都能先加 --dry-run 看要写多少行）
+      <details className="disclosure">
+        <summary>
+          位次卡位
+          <span className="disclosure-sub">暂无卡位目标</span>
+        </summary>
+        <div className="drawer-box">
+          <div className="note">
+            {note || '尚未配置卡位目标或暂无位次快照数据，完成采集后将自动展示。'}
           </div>
         </div>
-      </div>
+      </details>
     )
   }
 
+  const staleCount = targets.filter((t) => {
+    const age = ageHours(t.observed_at)
+    return age != null && age > MAX_AGE_HOURS
+  }).length
+
   return (
-    <div className="card">
-      <h2>
+    <details className="disclosure">
+      <summary>
         位次卡位
-        <span className="sub">
+        {staleCount > 0 && <span className="disclosure-dot" title={`${staleCount} 个词位次快照已过期`} />}
+        <span className="disclosure-sub">
           {summary.n_have_data}/{summary.n_targets} 个词有位次 · 已在目标位 {summary.n_on_goal} 个
         </span>
-      </h2>
+        {staleCount > 0 && <span className="disclosure-right">{staleCount} 个已过期</span>}
+      </summary>
 
-      <table>
-        <thead>
-          <tr>
-            <th>关键词</th>
-            <th>目标位次</th>
-            <th className="num">当前位次</th>
-            <th className="num">当前页</th>
-            <th>位次类型</th>
-            <th>观测时间</th>
-            <th className="num">差几个位次</th>
-            <th className="num">已推次数</th>
-          </tr>
-        </thead>
-        <tbody>
-          {targets.map((t) => {
-            const age = ageHours(t.observed_at)
-            const stale = age != null && age > MAX_AGE_HOURS
-            return (
-              <tr key={t.keyword_id}>
-                <td>
-                  <b>{t.keyword_text}</b>
-                  {t.status !== 'active' ? (
-                    <div className="small muted">{t.status}</div>
-                  ) : null}
-                </td>
-                <td className="small">{goalText(t.goal_page, t.goal_position)}</td>
-                <td className="num">
-                  {num(t.latest_position)}
-                  {t.on_goal ? (
-                    <span className="tag ok" style={{ marginLeft: 6 }}>
-                      到位
-                    </span>
-                  ) : null}
-                </td>
-                <td className="num">{num(t.latest_page)}</td>
-                <td className="small">
-                  {/* 广告位才是卡位真正能影响的那条轨道；自然位只作对照。 */}
-                  {t.latest_placement === 'sponsored'
-                    ? '广告位'
-                    : t.latest_placement === 'organic'
-                      ? '自然位'
-                      : '—'}
-                </td>
-                <td className="small muted">
-                  {fmtAt(t.observed_at)}
-                  {stale ? (
-                    <span className="tag near" style={{ marginLeft: 6 }}>
-                      已过期
-                    </span>
-                  ) : null}
-                </td>
-                <td className="num">{gapText(t)}</td>
-                <td className="num">
-                  {t.pushes_used}
-                  <span className="small muted"> / {t.max_pushes}</span>
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-
-      <div className="small muted" style={{ margin: '14px 0 4px' }}>
-        位次走向（每个词最近 5 个观测点，从左到右由旧到新；数字越小越靠前）
-      </div>
-      {Object.keys(series).length === 0 ? (
-        <div className="note">还没有可画的走向 —— 位次快照里没有这些词的广告位观测。</div>
-      ) : (
+      <div className="drawer-box">
         <table>
           <thead>
             <tr>
               <th>关键词</th>
-              <th>最近走向</th>
+              <th>目标位次</th>
+              <th className="num">当前位次</th>
+              <th className="num">当前页</th>
+              <th>位次类型</th>
+              <th>观测时间</th>
+              <th className="num">差几个位次</th>
+              <th className="num">已推次数</th>
             </tr>
           </thead>
           <tbody>
-            {Object.entries(series).map(([kw, points]) => (
-              <tr key={kw}>
-                <td className="small">{kw}</td>
-                <td className="mono">{seriesText(points)}</td>
-              </tr>
-            ))}
+            {targets.map((t) => {
+              const age = ageHours(t.observed_at)
+              const stale = age != null && age > MAX_AGE_HOURS
+              return (
+                <tr key={t.keyword_id}>
+                  <td>
+                    <b>{t.keyword_text}</b>
+                    {t.status !== 'active' ? (
+                      <div className="small muted">{t.status}</div>
+                    ) : null}
+                  </td>
+                  <td className="small">{goalText(t.goal_page, t.goal_position)}</td>
+                  <td className="num">
+                    {num(t.latest_position)}
+                    {t.on_goal ? (
+                      <span className="tag ok" style={{ marginLeft: 6 }}>
+                        到位
+                      </span>
+                    ) : null}
+                  </td>
+                  <td className="num">{num(t.latest_page)}</td>
+                  <td className="small">
+                    {/* 广告位才是卡位真正能影响的那条轨道；自然位只作对照。 */}
+                    {t.latest_placement === 'sponsored'
+                      ? '广告位'
+                      : t.latest_placement === 'organic'
+                        ? '自然位'
+                        : '—'}
+                  </td>
+                  <td className="small muted">
+                    {fmtAt(t.observed_at)}
+                    {stale ? (
+                      <span className="tag near" style={{ marginLeft: 6 }}>
+                        已过期
+                      </span>
+                    ) : null}
+                  </td>
+                  <td className="num">{gapText(t)}</td>
+                  <td className="num">
+                    {t.pushes_used}
+                    <span className="small muted"> / {t.max_pushes}</span>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
-      )}
 
-      {note ? (
-        <div className="small muted" style={{ marginTop: 10 }}>
-          {note}
+        <div className="small muted" style={{ margin: '14px 0 4px' }}>
+          位次走向（每个词最近 5 个观测点，从左到右由旧到新；数字越小越靠前）
         </div>
-      ) : null}
-    </div>
+        {Object.keys(series).length === 0 ? (
+          <div className="note">还没有可画的走向 —— 位次快照里没有这些词的广告位观测。</div>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>关键词</th>
+                <th>最近走向</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(series).map(([kw, points]) => (
+                <tr key={kw}>
+                  <td className="small">{kw}</td>
+                  <td className="mono">{seriesText(points)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        {note ? (
+          <div className="small muted" style={{ marginTop: 10 }}>
+            {note}
+          </div>
+        ) : null}
+      </div>
+    </details>
   )
 }

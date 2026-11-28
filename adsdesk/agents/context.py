@@ -127,7 +127,8 @@ def open_assumptions(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def _self_check(conn: sqlite3.Connection, wrong_limit: int = 5, correct_limit: int = 3) -> dict:
+def _self_check(conn: sqlite3.Connection, agent: str = "diagnose",
+                wrong_limit: int = 5, correct_limit: int = 3) -> dict:
     """你自己的断言到期后被判成什么样。
 
     为什么要给这块：diagnose 每轮写 4~7 条可验证断言（agent_eval），到期由
@@ -139,6 +140,11 @@ def _self_check(conn: sqlite3.Connection, wrong_limit: int = 5, correct_limit: i
 
     错的给 5 条、对的给 3 条 —— 不是对称的。只喂错会让它过度自我否定，
     全对称又会让「我大部分是对的」盖过那几条具体的教训。
+
+    ⚠ 必须按 agent 过滤。agent_eval 是各 agent 共用的一张表，早先这里不过滤，
+    等于把别的 agent 的错账念给当前这个听 —— 现在表里只有 diagnose 一个 agent
+    在写（37 correct / 15 wrong），所以看不出问题；一旦 record/converge 也开始
+    写断言，diagnose 就会背别人的锅，而它无从辩解。
     """
     sc = conn.execute(
         """select
@@ -146,7 +152,8 @@ def _self_check(conn: sqlite3.Connection, wrong_limit: int = 5, correct_limit: i
              sum(case when verdict='wrong'   then 1 else 0 end) as wrong,
              sum(case when verdict='unverifiable' then 1 else 0 end) as unverifiable,
              sum(case when verdict='pending' then 1 else 0 end) as pending
-           from agent_eval"""
+           from agent_eval where agent=?""",
+        (agent,),
     ).fetchone()
     correct = sc["correct"] or 0
     wrong = sc["wrong"] or 0
@@ -172,9 +179,9 @@ def _self_check(conn: sqlite3.Connection, wrong_limit: int = 5, correct_limit: i
     def _rows(verdict: str, limit: int) -> list[dict]:
         rows = conn.execute(
             """select claim, expected, method, actual, checked_at
-               from agent_eval where verdict=? and actual is not null
+               from agent_eval where verdict=? and agent=? and actual is not null
                order by checked_at desc, eval_id desc limit ?""",
-            (verdict, limit),
+            (verdict, agent, limit),
         ).fetchall()
         return [
             {"checked_on": (r["checked_at"] or "")[:10],

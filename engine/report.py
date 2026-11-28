@@ -416,8 +416,17 @@ def _build_questions(f: facts.Facts, front: list, alerts: list,
             return {}
         try:
             return reason_routes.active_codes(conn, str(object_id))
-        except sqlite3.Error:
-            return {}      # 去重查不动，不能让今天的机会清单消失
+        except sqlite3.Error as e:
+            # 查不动不能让今天的机会清单消失（这是原来的判断，仍然成立），
+            # 但也**不能装成「没有沉淀」**：那会把已经答过、还在生效期内的题
+            # 重新问一遍。2026-11-26 实测过这个后果 —— 给 object_id 插 3 条
+            # 生效中的 goal_* policy，再让 active_codes 抛错，
+            # 题数从 0 变成 1（Q08 被重新问），备注里那句「都在生效期内，本次不再问」
+            # 也消失了。人看到的是一张「系统忘了我说过什么」的奏折。
+            # 所以：退回空字典（清单照出），但把故障写进备注，让它可见。
+            notes.append(f"[去重失效] 读沉淀失败（{type(e).__name__}: {e}），"
+                         f"本次可能重复问已经答过的问题。")
+            return {}
 
     def _crossed(object_id) -> dict:
         """这个对象上「还没出静默期」的显式划掉：原因码 → 静默到哪天。"""
@@ -425,8 +434,12 @@ def _build_questions(f: facts.Facts, front: list, alerts: list,
             return {}
         try:
             return reason_routes.excluded_until(conn, str(object_id))
-        except sqlite3.Error:
-            return {}      # 同上：查不动不能让清单消失
+        except sqlite3.Error as e:
+            # 同上：查不动不能让清单消失，但要让「划掉过什么」这件事的失效可见。
+            # 这个方向更敏感 —— 静默期是用户亲手划的，读不到就等于把划掉的又端回来。
+            notes.append(f"[静默失效] 读划掉记录失败（{type(e).__name__}: {e}），"
+                         f"本次可能重问你已经划掉的方向。")
+            return {}
 
     acct = _active(scope.SCOPE_ASIN)
 
@@ -461,14 +474,21 @@ def _build_questions(f: facts.Facts, front: list, alerts: list,
                 m["excluded"] = True
                 m["exclude_until"] = crossed_until.get(code)
             metas.append(m)
-        q = {"id": qid, "object": obj, "ask": ask_text,
+        # id 是「题号」，同一份奏折里会重复（Q01 可以问 3 个不同的词）。
+        # 打钩是按题定位的，用 id 定位会永远命中第一题 ——
+        # 实测 2026-11-26 的 run #123：Q08（账户级，object=本组合目标）
+        # 和 Q01（词级，object=lat pulldown）同时存在，
+        # 后端 `next(x for x in questions if x["id"] == qid)` 取到的永远是第一条，
+        # 于是给「词」打的钩被写到了「账户」对象上。
+        # qkey 是这份奏折内唯一的位置标识；老奏折没有它，读侧回退到 id。
+        qkey = f"{qid}#{len(qs) + 1}"
+        q = {"id": qid, "qkey": qkey, "object": obj, "ask": ask_text,
              "options": [t for t, _, _ in options],
              "reason_codes": [c for _, c, _ in options],
              "option_meta": metas}
         if decision_ref:
             q["decision_ref"] = decision_ref
         qs.append(q)
-
     if not f.target_reachable:
         be = f.breakeven.get("breakeven_cvr")
         relax = _relaxed_target(f)

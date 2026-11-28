@@ -19,7 +19,7 @@ import math
 import sqlite3
 from dataclasses import dataclass, field
 import scope
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from statistics import median
 from typing import Any
 
@@ -77,6 +77,57 @@ def _safe_div(a: float, b: float) -> float | None:
 
 def _r(x: float | None, nd: int = 4) -> float | None:
     return round(x, nd) if x is not None else None
+
+
+# ---------------------------------------------------------------- 冷却期
+
+CST = timezone(timedelta(hours=8))
+
+
+def parse_ts(s: Any) -> datetime | None:
+    """把库里的时间串解析成 aware datetime。
+
+    无时区后缀的按 CST 解释 —— 历史行是 `rules._now()` 写的 naive 本地时间
+    （形如 `2026-11-19T14:17:11`），新行带 `+08:00`。两种都要能读，
+    否则一升级就让所有老行变成「解析失败 → 冷却失效」。
+    """
+    if s is None or s == "":
+        return None
+    if isinstance(s, datetime):
+        return s if s.tzinfo else s.replace(tzinfo=CST)
+    try:
+        dt = datetime.fromisoformat(str(s).strip().replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=CST)
+
+
+def active_cooldowns(conn: sqlite3.Connection,
+                     now: datetime | None = None) -> dict[str, str]:
+    """仍在冷却期的对象：`"entity_type:entity_id"` -> cooldown_until。
+
+    **只认 status='executed'。** 这一条是整件事的关键：
+    `cooldown_until` 是在**提案时**就写好的（`rules._cooldown()`，见 R01/R03/R31/R08）。
+    如果按 `status in ('proposed','approved','executed')` 去查，提案会被自己的冷却期
+    屏蔽掉 —— 同一天第二次跑、或次日还没审批，建议就从待审台（memorial.pack.front）
+    消失。真正要防的是「同一个对象 72 小时内被改两次」，所以只有 executed 才算数。
+
+    executed 行的 cooldown_until 由 `approve.mark_executed` 回写；提案行上那个值
+    只作为「建议里写明了冷却到几点」的信息，不参与抑制。
+    """
+    now = now or datetime.now(CST)
+    rows = _rows(conn, """
+        select entity_type, entity_id, cooldown_until
+          from decision_log
+         where status = 'executed'
+           and cooldown_until is not null
+    """)
+    out: dict[str, str] = {}
+    for r in rows:
+        until = parse_ts(r.get("cooldown_until"))
+        if until and until > now:
+            out[f"{r['entity_type']}:{r['entity_id']}"] = str(r.get("cooldown_until"))
+    return out
 
 
 # ---------------------------------------------------------------- 账户漏斗
@@ -840,7 +891,14 @@ def cost_ceiling(conn: sqlite3.Connection, start: str, end: str,
                 "note": "客单价或目标 ACOS 缺失，算不出「一单允许花多少」，这条线不启用"}
 
     threshold = unit * multiple
-    rows = _rows(conn, """
+    # scope 必须跟着进 SQL。
+    # 早先这条查询只按 report_date 过滤，把**全店所有活动**的零单词都算进来 ——
+    # 而止损线的口径是「本组合花掉了几单的钱」（unit_cost 取的是本组合 aov ×
+    # 目标 ACOS）。口径不匹配的后果是：组合外的词（68 个，窗口内合计 $910.77）
+    # 会被塞进「本组合的止损清单」，主人照着停的是别人的词。
+    # 当前阈值 $169.19 高于窗口内任一单词的花费（最高 $104.78），所以一条都没冒出来，
+    # 属潜伏缺陷；一旦预算放大或窗口拉长就会显形。
+    rows = _rows(conn, f"""
         select keyword_id, keyword_text, campaign_id, ad_group_id,
                sum(clicks) clicks, sum(cost) cost, sum(ads_orders) orders,
                sum(ads_sales) sales,
@@ -848,6 +906,7 @@ def cost_ceiling(conn: sqlite3.Connection, start: str, end: str,
                count(distinct report_date) days
         from fact_keyword_daily
         where report_date between ? and ?
+          and {scope.campaign_predicate()}
         group by keyword_id, keyword_text, campaign_id, ad_group_id
         having sum(ads_orders) = 0
            and sum(cost) >= ?
@@ -1738,6 +1797,9 @@ class Facts:
     # engine/record.py 算出的规则战绩与对象历史。由 run.py 填，不在这里算 ——
     # facts 的职责是「这次窗口的数据」，战绩是「跨运行的历史」，两件事。
     record: dict = field(default_factory=dict)
+    # "entity_type:entity_id" -> cooldown_until：仍在冷却期的对象（只统计已执行的行）。
+    # R01/R03/R31 遇到就要让路 —— 同一个词 72 小时内被改两次，第二次是噪声。
+    cooldown_until: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     scope_label: str = ""
 
@@ -1757,6 +1819,14 @@ class Facts:
         钱是按点击花的，降 20% 只是把同样的亏慢一点亏完。
         """
         return {k["keyword_id"] for k in (self.cost_ceiling or {}).get("keywords", [])}
+
+    def in_cooldown(self, entity_type: str, entity_id: str) -> str | None:
+        """这个对象还在冷却期吗？在就返回冷却到期时间（写进 suppress 理由用），否则 None。
+
+        只对已执行过的行生效 —— 见 `active_cooldowns()` 的注释，
+        提案行上的 cooldown_until 不参与抑制，否则会把自己的待审建议屏蔽掉。
+        """
+        return (self.cooldown_until or {}).get(f"{entity_type}:{entity_id}")
 
     @property
     def account_baseline(self) -> dict:
@@ -1908,6 +1978,7 @@ def build_facts(conn: sqlite3.Connection,
         layer_evidence=_safe_layer_evidence(conn, start, end),
         alert_history={"R30": alert_history(conn, "R30")},
         placement_max_adjustment=placement_max_adjustment(conn, start, end),
+        cooldown_until=active_cooldowns(conn),
         scope_label=scope.SCOPE_LABEL,
     )
     facts.notes.append(

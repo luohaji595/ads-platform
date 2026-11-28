@@ -1,0 +1,833 @@
+{
+  "window_start": "2026-11-09",
+  "window_end": "2026-11-22",
+  "run_id": 122,
+  "front": [],
+  "observing": [
+    {
+      "decision_id": 155,
+      "rule_id": "R01",
+      "entity_type": "keyword",
+      "entity_id": "277840567753078",
+      "entity_label": "lat pulldown",
+      "action_type": "observe",
+      "action_label": "只看不动",
+      "current_value": 0.4,
+      "proposed_value": 0.32,
+      "spend_impact": 20.16,
+      "confidence": "low",
+      "rationale": "有销售额：销售额 × 目标ACOS ÷ 点击 = $0.8949；÷ CPC 校准系数 1.000 ÷ 位次溢价 338%（这个活动的点击加权溢价，不是最高档） → 目标 bid $0.2043；单次最多降 20% → $0.40 → $0.32；要走 4 步才到目标价；cpc/bid=4.27，有效出价被位次加价或动态竞价放大；降 base bid 会等比放大降幅，实际降幅可能超出预期；**注意**：本组合的目标 ACOS 不可达（CVR 低于盈亏平衡线），降 bid 只能减少无效花费，不能把 ACOS 拉到达标",
+      "status": "observing",
+      "calculation": [
+        {
+          "step": "目标 bid",
+          "branch": "有销售额",
+          "formula": "销售额 × 目标ACOS ÷ 点击",
+          "params": {
+            "sales": 175.99,
+            "orders": 1,
+            "clicks": 59,
+            "aov": 188.99,
+            "target_acos": 0.3
+          },
+          "result": 0.8949
+        },
+        {
+          "step": "CPC 校准",
+          "formula": "目标bid ÷ cpc_bias ÷ (1 + 位次溢价/100)",
+          "params": {
+            "raw": 0.8949,
+            "cpc_bias": 1.0,
+            "campaign_adj_pct": 338.1,
+            "cpc_bias_nominal": 2.5,
+            "cpc_bias_n": 66,
+            "cpc_bias_p10": 0.7989,
+            "cpc_bias_p90": 1.0378
+          },
+          "result": 0.2043
+        },
+        {
+          "step": "花费闸门",
+          "formula": "cost < aov × target_acos",
+          "params": {
+            "cost": 100.79,
+            "gate": 56.7
+          },
+          "result": true
+        },
+        {
+          "step": "地板校验",
+          "formula": "floor_nominal = floor_effective / (1 + 溢价/100); 目标bid >= floor_nominal；否则算压到地板的预期每单成本",
+          "params": {
+            "optimum": 0.2043,
+            "floor_effective": 0.8,
+            "floor_nominal": 0.1826,
+            "campaign_adj_pct": 338.1,
+            "floor_basis": "effective_bid",
+            "floor_confidence": "low",
+            "floor_estimable": false,
+            "kw_cvr": 0.016949
+          },
+          "result": {
+            "floor_hit": false,
+            "floor_cpa": null
+          },
+          "meaning": "目标价可执行"
+        },
+        {
+          "step": "单步限制",
+          "formula": "new = max(目标bid, bid × (1-0.2))，夹到 0.01",
+          "params": {
+            "bid": 0.4,
+            "target": 0.2
+          },
+          "result": 0.32
+        },
+        {
+          "step": "cpc/bid 判据",
+          "formula": "cpc ÷ bid",
+          "params": {
+            "cpc": 1.7083,
+            "bid": 0.4
+          },
+          "result": 4.2707,
+          "verdict": "uplifted",
+          "means": "cpc/bid=4.27，有效出价被位次加价或动态竞价放大",
+          "bid_change_effective": true,
+          "caution": "降 base bid 会等比放大降幅，实际降幅可能超出预期"
+        }
+      ],
+      "significance": {
+        "clicks": 59,
+        "orders": 1,
+        "min_clicks_needed": 671,
+        "need_if_zero": 361,
+        "p_worse": 0.971239,
+        "p_better": 0.231772,
+        "p_directional": 0.971239,
+        "direction": "worse",
+        "verdict": "inconclusive",
+        "expected_orders": 0.26,
+        "confidence_basis": "59 击 1 单，按基线应出 0.26 单；判「更差」需 671 击",
+        "statistically_conclusive": false
+      },
+      "campaign_id": "237761921757002",
+      "ad_group_id": "201416328459856",
+      "gate_reason": "证据不够：59 击 1 单，按基线应出 0.26 单；判「更差」需 671 击",
+      "held": false,
+      "rule_record": null,
+      "object_record": null
+    },
+    {
+      "decision_id": 174,
+      "rule_id": "R21",
+      "entity_type": "search_term",
+      "entity_id": "pull down machine",
+      "entity_label": "pull down machine",
+      "action_type": "observe",
+      "action_label": "只看不动",
+      "current_value": null,
+      "proposed_value": "consider_new_ad_group",
+      "spend_impact": 0.0,
+      "confidence": "low",
+      "rationale": "8 击 / $9.81 / 0 单，还没作为关键词投放。**未验证** —— 建议先观察，或在低预算活动里试投，不要直接给主力预算。",
+      "status": "observing",
+      "calculation": [
+        {
+          "step": "筛选",
+          "formula": "orders==0 and clicks>=5 and cost>=5 and not existing keyword",
+          "params": {
+            "clicks": 8,
+            "cost": 9.81
+          },
+          "result": true
+        }
+      ],
+      "significance": {
+        "clicks": 8,
+        "orders": 0,
+        "statistically_conclusive": false,
+        "confidence_basis": "零单，样本不足以判断好坏"
+      },
+      "campaign_id": null,
+      "ad_group_id": null,
+      "gate_reason": "证据不够：零单，样本不足以判断好坏",
+      "held": false,
+      "rule_record": null,
+      "object_record": null
+    }
+  ],
+  "overflow": [],
+  "below": [],
+  "questions": [
+    {
+      "id": "Q08",
+      "object": "本组合目标",
+      "ask": "本组合窗口转化率 0.45%，达不到目标 ACOS 30.00% 所需的 1.56%。降出价只能少花钱，不能把转化率抬上去。今天怎么处理这个目标？",
+      "options": [
+        "先维持 30.00%，下面降价建议只用来控损",
+        "把目标 ACOS 放宽到 80.00%，重新算一遍建议",
+        "先不动出价，去查主图 / 价格 / 落地页",
+        "其他（请补一句依据）"
+      ],
+      "reason_codes": [
+        "goal_keep_acos30_control_loss",
+        "goal_relax_acos",
+        "goal_product_side_problem",
+        "goal_other"
+      ],
+      "option_meta": [
+        {
+          "reason_code": "goal_keep_acos30_control_loss",
+          "destination": "policy",
+          "scope": "account",
+          "object_id": "B0GLYW51HY",
+          "policy_type": "acos_cap_accept_loss",
+          "target_acos": 0.3
+        },
+        {
+          "reason_code": "goal_relax_acos",
+          "destination": "param_override",
+          "scope": "account",
+          "object_id": "B0GLYW51HY",
+          "param_key": "target_acos",
+          "param_value": 0.8,
+          "ttl_days": 90,
+          "hypothesis": "按 80.00% 算还能不亏",
+          "judge_rule": "到期实际 ACOS 落进新目标 → 成立；否则回调"
+        },
+        {
+          "reason_code": "goal_product_side_problem",
+          "destination": "observation_task",
+          "scope": "account",
+          "object_id": "B0GLYW51HY",
+          "metric": "cvr",
+          "ttl_days": 14
+        },
+        {
+          "reason_code": "goal_other",
+          "destination": "reason_hit"
+        }
+      ],
+      "decision_ref": null
+    }
+  ],
+  "conflicts": [
+    {
+      "keyword_text": "lat pulldown",
+      "campaigns": [
+        {
+          "campaign_id": "175723193023274",
+          "campaign_name": "L3-基础bid0.8 top-lat pulldown-fix",
+          "keyword_ids": [
+            "151878211767486"
+          ],
+          "clicks": 160,
+          "orders": 1,
+          "cost": 147.58,
+          "sales": 179.99,
+          "bid": 1.0,
+          "cpc": 0.9224,
+          "cvr": 0.00625,
+          "acos": 0.8199,
+          "share": 0.5924,
+          "placement_cap": 2.0,
+          "placement_cap_pct": 100.0
+        },
+        {
+          "campaign_id": "237761921757002",
+          "campaign_name": "L3-基础bid0.4 溢价1.4 top-lat pulldown-fix",
+          "keyword_ids": [
+            "277840567753078"
+          ],
+          "clicks": 59,
+          "orders": 1,
+          "cost": 100.79,
+          "sales": 175.99,
+          "bid": 0.4,
+          "cpc": 1.7083,
+          "cvr": 0.016949,
+          "acos": 0.5727,
+          "share": 0.4046,
+          "placement_cap": 1.8,
+          "placement_cap_pct": 350.0
+        },
+        {
+          "campaign_id": "127294500024173",
+          "campaign_name": "L3-lat pulldown",
+          "keyword_ids": [
+            "32698641714540"
+          ],
+          "clicks": 1,
+          "orders": 0,
+          "cost": 0.77,
+          "sales": 0.0,
+          "bid": 0.77,
+          "cpc": 0.77,
+          "cvr": 0.0,
+          "acos": null,
+          "share": 0.0031,
+          "placement_cap": 0.77,
+          "placement_cap_pct": 0.0
+        }
+      ]
+    },
+    {
+      "keyword_text": "lat pulldown machines",
+      "campaigns": [
+        {
+          "campaign_id": "87365978371695",
+          "campaign_name": "L3-基础cpc 0.6-lat pulldown machines",
+          "keyword_ids": [
+            "244812103358332"
+          ],
+          "clicks": 271,
+          "orders": 1,
+          "cost": 180.41,
+          "sales": 219.99,
+          "bid": 0.65,
+          "cpc": 0.6657,
+          "cvr": 0.00369,
+          "acos": 0.8201,
+          "share": 0.9863,
+          "placement_cap": 0.975,
+          "placement_cap_pct": 50.0
+        },
+        {
+          "campaign_id": "49766153841808",
+          "campaign_name": "L3-基础bid 0.5 无溢价 -捡漏-fix",
+          "keyword_ids": [
+            "104863636196372"
+          ],
+          "clicks": 5,
+          "orders": 0,
+          "cost": 2.5,
+          "sales": 0.0,
+          "bid": 0.5,
+          "cpc": 0.5,
+          "cvr": 0.0,
+          "acos": null,
+          "share": 0.0137,
+          "placement_cap": 0.5,
+          "placement_cap_pct": 0.0
+        }
+      ]
+    }
+  ],
+  "conflict_count": 2,
+  "overflow_count": 0,
+  "below_count": 0,
+  "notes": [
+    "另有 1 条不够线的对象已在账本里表过态，不再重复列出。"
+  ],
+  "saved": 0,
+  "spent": 0,
+  "target_reachable": false,
+  "layer_evidence": [
+    {
+      "layer": "keyword_text",
+      "label": "关键词层",
+      "significant": false,
+      "p_value": 0.8354,
+      "groups": 4,
+      "clicks": 630,
+      "orders": 4,
+      "scoped": true,
+      "covered_clicks": 630,
+      "base_clicks": 897,
+      "coverage": 0.7023411371237458,
+      "detectable_ratio": 3.0
+    },
+    {
+      "layer": "campaign",
+      "label": "活动层",
+      "significant": false,
+      "p_value": 0.9069,
+      "groups": 10,
+      "clicks": 897,
+      "orders": 4,
+      "scoped": true,
+      "covered_clicks": 897,
+      "base_clicks": 897,
+      "coverage": 1.0,
+      "detectable_ratio": 5.1
+    },
+    {
+      "layer": "placement",
+      "label": "位次层",
+      "significant": false,
+      "p_value": 0.7241,
+      "groups": 4,
+      "clicks": 896,
+      "orders": 4,
+      "scoped": true,
+      "covered_clicks": 896,
+      "base_clicks": 897,
+      "coverage": 0.9988851727982163,
+      "detectable_ratio": 3.1
+    },
+    {
+      "layer": "match_type",
+      "label": "匹配方式层",
+      "significant": null,
+      "p_value": null,
+      "groups": null,
+      "clicks": null,
+      "orders": null,
+      "scoped": true,
+      "covered_clicks": 0,
+      "base_clicks": 897,
+      "coverage": 0.0,
+      "detectable_ratio": null
+    },
+    {
+      "layer": "portfolio",
+      "label": "投放组合层",
+      "significant": true,
+      "p_value": 0.0,
+      "groups": 12,
+      "clicks": 5568,
+      "orders": 117,
+      "scoped": false,
+      "covered_clicks": 5568,
+      "base_clicks": 897,
+      "coverage": 6.207357859531773,
+      "detectable_ratio": 1.6
+    }
+  ],
+  "portfolio_headline": "本组合转化率 0.45%，账户整体 2.10%，只有账户的 **0.21 倍**。这不是出价能修的问题，问题在产品/Listing/价格层——广告层只能止损，不能做增长。",
+  "who_manages": [
+    {
+      "campaign_id": "87365978371695",
+      "campaign": "L3-基础cpc 0.6-lat pulldown machines",
+      "cost": 180.41,
+      "orders": 1,
+      "kind": "无人管",
+      "how": "没有 —— 今天没有任何规则对它出手"
+    },
+    {
+      "campaign_id": "47309998237757",
+      "campaign": "L3-基础CPC0.4-头部200%-lat pulldown machine-Fix",
+      "cost": 162.22,
+      "orders": 1,
+      "kind": "无人管",
+      "how": "没有 —— 今天没有任何规则对它出手"
+    },
+    {
+      "campaign_id": "175723193023274",
+      "campaign": "L3-基础bid0.8 top-lat pulldown-fix",
+      "cost": 147.58,
+      "orders": 1,
+      "kind": "无人管",
+      "how": "没有 —— 今天没有任何规则对它出手"
+    }
+  ],
+  "alerts": [
+    {
+      "decision_id": 225,
+      "rule_id": "R30",
+      "entity_type": "account",
+      "entity_id": "all",
+      "entity_label": "全店",
+      "action_type": "alert",
+      "action_label": "全局告警",
+      "current_value": null,
+      "proposed_value": null,
+      "spend_impact": 0.0,
+      "confidence": "high",
+      "rationale": "**全店口径**：目标 ACOS 30% 在当前 CPC $0.97 与客单价 $100 下不可达 —— 需要 CVR ≥ 3.24%，实际只有 2.10%（差 1.14%，要达到 1.54 倍，即提升 54%）。本组合更差：CPC $0.89、客单价 $189，要求 CVR ≥ 1.56%，实际 0.45%（差 1.12%，要达到 3.51 倍，即提升 251%）。对面另一半不是这样：把本组合剔掉，其余花费 CVR 2.42%、盈亏线 3.41%，仍差 0.99%（1.41 倍）。**这是两个问题，不是一个大问题**：全店那块要动的是 CPC 与定价（那部分 CPC 已经不便宜），本组合要动的是转化（Listing / 价格 / 评论 / 主图）。把两件事合成一条，会让人以为「不可达」是一个可以一次解决的东西。**降出价改变不了这件事** —— ACOS 的上限由 CVR 决定，出价只决定每击多少钱，把 CPC 压到 0 也只是让亏损变慢，不会让 ACOS 达标。要真到 30%，动的是转化链路（Listing / 价格 / 评论 / 主图）或放宽目标 ACOS。**这条只陈述算术，不回答「那现在该做什么」，也不解释正文为什么是空的** —— 它跑在 rules.run_all 里，看不见置信度门控、配额外挤和观察期锁的结果。具体每条为什么没进正文，由奏折的「今日只观察」区逐条写；这条不猜，也不替它猜。**它凭什么还在这儿**（两半各自判，一半达标不会让另一半跟着消失）：全店这半要 CVR 从 2.10% 涨到 3.24%，本组合这半要从 0.45% 涨到 1.56%。把目标 ACOS 放宽到 46.3%（全店）/105.2%（本组合）确实会让它不再出现 —— 但这两个数**正好等于当前实际 ACOS**，所以那不是退出条件，是接受现状。**真正会让它重新算的**：CVR、CPC、客单价任一项变了。**这条已经是第 7 天了**（2026-11-16 起，按天算）。",
+      "status": "notified",
+      "calculation": [
+        {
+          "step": "目标可达性（全店口径）",
+          "formula": "breakeven_cvr = cpc / (aov * target_acos)",
+          "params": {
+            "cpc": 0.9725,
+            "aov": 99.93,
+            "target_acos": 0.3
+          },
+          "result": {
+            "breakeven_cvr": 0.032439,
+            "actual_cvr": 0.021013,
+            "gap": 0.011426,
+            "need_multiple": 1.544,
+            "target_acos_required": 0.463133
+          },
+          "meaning": "全店：目标 ACOS 30% 要求 CVR ≥ 3.24%，实际 2.10%，差 1.14%（要达到 1.54 倍，即提升 54%）"
+        },
+        {
+          "step": "目标可达性（本组合对照）",
+          "formula": "breakeven_cvr = cpc / (aov * target_acos)",
+          "params": {
+            "cpc": 0.8868,
+            "aov": 188.99,
+            "target_acos": 0.3
+          },
+          "result": {
+            "breakeven_cvr": 0.015641,
+            "actual_cvr": 0.004459,
+            "gap": 0.011182,
+            "need_multiple": 3.508
+          },
+          "meaning": "本组合：要求 CVR ≥ 1.56%，实际 0.45%"
+        }
+      ],
+      "significance": {
+        "clicks": 5568,
+        "orders": 117,
+        "note": "全店样本，点击量足够判断 CVR 量级"
+      },
+      "campaign_id": null,
+      "ad_group_id": null,
+      "gate_reason": null,
+      "held": false,
+      "rule_record": null,
+      "object_record": null
+    }
+  ],
+  "scope": {
+    "label": "高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）",
+    "cost": 795.45,
+    "clicks": 897,
+    "orders": 4,
+    "sales": 755.96,
+    "impressions": 65910,
+    "acos": 1.0522,
+    "cvr": 0.004459,
+    "cpc": 0.8868,
+    "aov": 188.99
+  },
+  "account": {
+    "clicks": 5568,
+    "orders": 117,
+    "cvr": 0.021013,
+    "cost": 5414.64,
+    "sales": 11692.27,
+    "cpc": 0.9725,
+    "aov": 99.93,
+    "acos": 0.4631,
+    "breakeven_cvr": 0.032439,
+    "note": "全店（所有投放组合合计），不是本组合的数"
+  },
+  "breakeven": {
+    "breakeven_cvr": 0.015641,
+    "target_reachable": false
+  },
+  "cpc_bias": {
+    "overall": 1.0,
+    "nominal_overall": 2.5,
+    "n": 66,
+    "p10": 0.7989,
+    "p90": 1.0378,
+    "note": "overall 是相对**有效出价**（bid × (1+位次溢价)）的比值；nominal_overall 是相对名义 bid 的比值，把 0% 与 350% 溢价的活动混在一起取中位数，不代表换算关系。降 bid 的目标价要先除 cpc_bias 再除 (1+溢价)。",
+    "by_campaign": [
+      {
+        "campaign_id": "47309998237757",
+        "median": 1.0066,
+        "n": 14,
+        "adj_pct": 277.5
+      },
+      {
+        "campaign_id": "237761921757002",
+        "median": 1.0272,
+        "n": 14,
+        "adj_pct": 338.1
+      },
+      {
+        "campaign_id": "46818486452618",
+        "median": 1.0378,
+        "n": 13,
+        "adj_pct": 140.9
+      },
+      {
+        "campaign_id": "87365978371695",
+        "median": 0.9916,
+        "n": 11,
+        "adj_pct": 2.4
+      },
+      {
+        "campaign_id": "175723193023274",
+        "median": 1.0,
+        "n": 11,
+        "adj_pct": 0.0
+      },
+      {
+        "campaign_id": "49766153841808",
+        "median": 1.0,
+        "n": 2,
+        "adj_pct": 0.0
+      },
+      {
+        "campaign_id": "127294500024173",
+        "median": 1.0,
+        "n": 1,
+        "adj_pct": 0.0
+      }
+    ]
+  },
+  "floor": {
+    "floor": 0.8,
+    "basis": "effective_bid",
+    "estimable": false,
+    "confidence": "low",
+    "note": "floor 是**有效出价**口径（bid × (1+位次溢价)），不是名义 bid。约束某活动的名义 bid 时要先除以它的 (1+点击加权溢价/100)。"
+  },
+  "suppressed": [
+    {
+      "rule_id": "R01",
+      "entity": "lat pulldown machines",
+      "reason": "卡位接管",
+      "detail": {
+        "keyword_id": "244812103358332",
+        "note": "该词在 rank_target 里，出价由 R31 卡位驱动；同时降 bid 会与卡位加价互相打脸"
+      }
+    },
+    {
+      "rule_id": "R01",
+      "entity": "lat pulldown",
+      "reason": "卡位接管",
+      "detail": {
+        "keyword_id": "151878211767486",
+        "note": "该词在 rank_target 里，出价由 R31 卡位驱动；同时降 bid 会与卡位加价互相打脸"
+      }
+    },
+    {
+      "rule_id": "R01",
+      "entity": "pulldown machine",
+      "reason": "花费闸门",
+      "detail": {
+        "cost": 26.54,
+        "gate": 56.7,
+        "gate_formula": "客单价 × 目标ACOS",
+        "gate_inputs": {
+          "aov": 188.99,
+          "target_acos": 0.3
+        },
+        "note": "花了 $26.54，还没到「一单允许的广告花费上限」（客单价 $188.99 × 目标 ACOS 30% = $56.70），且 bid 已低于目标价，动它没意义。这不是在比 CPA。"
+      }
+    },
+    {
+      "rule_id": "R01",
+      "entity": "lat pulldown machines",
+      "reason": "花费闸门",
+      "detail": {
+        "cost": 2.5,
+        "gate": 56.7,
+        "gate_formula": "客单价 × 目标ACOS",
+        "gate_inputs": {
+          "aov": 188.99,
+          "target_acos": 0.3
+        },
+        "note": "花了 $2.50，还没到「一单允许的广告花费上限」（客单价 $188.99 × 目标 ACOS 30% = $56.70），且 bid 已低于目标价，动它没意义。这不是在比 CPA。"
+      }
+    },
+    {
+      "rule_id": "R01",
+      "entity": "lat pulldown",
+      "reason": "花费闸门",
+      "detail": {
+        "cost": 0.77,
+        "gate": 56.7,
+        "gate_formula": "客单价 × 目标ACOS",
+        "gate_inputs": {
+          "aov": 188.99,
+          "target_acos": 0.3
+        },
+        "note": "花了 $0.77，还没到「一单允许的广告花费上限」（客单价 $188.99 × 目标 ACOS 30% = $56.70），且 bid 已低于目标价，动它没意义。这不是在比 CPA。"
+      }
+    },
+    {
+      "rule_id": "R03",
+      "entity": "lat pulldown machines",
+      "reason": "卡位接管",
+      "detail": {
+        "keyword_id": "244812103358332",
+        "note": "该词出价由 R31 卡位驱动，R03 不再叠加加价"
+      }
+    },
+    {
+      "rule_id": "R03",
+      "entity": "lat pulldown machine",
+      "reason": "CVR 低于盈亏平衡",
+      "detail": {
+        "kw_cvr": 0.009,
+        "breakeven_cvr": 0.015641,
+        "note": "加价会放大亏损，不是放量"
+      }
+    },
+    {
+      "rule_id": "R03",
+      "entity": "lat pulldown",
+      "reason": "卡位接管",
+      "detail": {
+        "keyword_id": "151878211767486",
+        "note": "该词出价由 R31 卡位驱动，R03 不再叠加加价"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "rowing machine for home",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "60942325643302",
+        "portfolio": "HR -三合一",
+        "note": "该词在投（组合 HR -三合一），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 HR -三合一 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "ab machine",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "55661928359595",
+        "portfolio": "JL-美腰机",
+        "note": "该词在投（组合 JL-美腰机），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 JL-美腰机 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "lat pulldown machines",
+      "reason": "排名观测过期",
+      "detail": {
+        "age_hours": 29.04,
+        "max_age_hours": 6,
+        "note": "过期观测不能当当前位次用"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "lat pulldown",
+      "reason": "排名观测过期",
+      "detail": {
+        "age_hours": 44.57,
+        "max_age_hours": 6,
+        "note": "过期观测不能当当前位次用"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "rowing machine",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "253352375117392",
+        "portfolio": "HR-自发电划船机",
+        "note": "该词在投（组合 HR-自发电划船机），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 HR-自发电划船机 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "row machine",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "15169863726260",
+        "portfolio": "HR-自发电划船机",
+        "note": "该词在投（组合 HR-自发电划船机），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 HR-自发电划船机 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "row machine for home",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "131819126131160",
+        "portfolio": "HR-自发电划船机",
+        "note": "该词在投（组合 HR-自发电划船机），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 HR-自发电划船机 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "adjustable dumbbells",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "31281644161141",
+        "portfolio": "活动未归投放组合",
+        "note": "该词在投，但它所在的活动没归进任何投放组合，而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；先在积加里把这个活动归到某个投放组合，或把作业范围改成按活动选"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "wall mounted cable machine",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "44595130673863",
+        "portfolio": "HR-加高综训",
+        "note": "该词在投（组合 HR-加高综训），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 HR-加高综训 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "ab machine foldable",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "199065958233363",
+        "portfolio": "HR -三合一",
+        "note": "该词在投（组合 HR -三合一），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 HR -三合一 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "rowing machines for home",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "187530528667776",
+        "portfolio": "HR-自发电划船机",
+        "note": "该词在投（组合 HR-自发电划船机），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 HR-自发电划船机 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R31",
+      "entity": "desk treadmill",
+      "reason": "不在本次作业范围内",
+      "detail": {
+        "keyword_id": "125369903105654",
+        "portfolio": "跑步机",
+        "note": "该词在投（组合 跑步机），而本次作业范围是 高位下拉 B0GLYW51HY（投放组合 JL-高位下拉）；把作业范围扩到 跑步机 后这条才会出建议"
+      }
+    },
+    {
+      "rule_id": "R09",
+      "entity": "L4-竞品asin-skag-dynamic · Other on-Amazon",
+      "reason": "活动整体无销售额",
+      "detail": {
+        "campaign_roas": 0.0,
+        "cost": 45.79
+      }
+    },
+    {
+      "rule_id": "R09",
+      "entity": "L1-auto · Detail Page on-Amazon",
+      "reason": "活动整体无销售额",
+      "detail": {
+        "campaign_roas": 0.0,
+        "cost": 43.4
+      }
+    },
+    {
+      "rule_id": "R09",
+      "entity": "L1-auto · Other on-Amazon",
+      "reason": "活动整体无销售额",
+      "detail": {
+        "campaign_roas": 0.0,
+        "cost": 29.93
+      }
+    },
+    {
+      "rule_id": "R09",
+      "entity": "L4-竞品asin-skag-dynamic · Top of Search on-Amazon",
+      "reason": "活动整体无销售额",
+      "detail": {
+        "campaign_roas": 0.0,
+        "cost": 25.35
+      }
+    },
+    {
+      "rule_id": "R09",
+      "entity": "L3-基础bid0.7-pulldown machine · Top of Search on-Amazon",
+      "reason": "活动整体无销售额",
+      "detail": {
+        "campaign_roas": 0.0,
+        "cost": 24.64
+      }
+    }
+  ]
+}

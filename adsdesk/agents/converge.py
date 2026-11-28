@@ -76,6 +76,12 @@ except Exception as _exc:  # pragma: no cover - 引擎目录被改动时的兜�
     _FACTS_ERROR = str(_exc)
 
 CST = ZoneInfo("Asia/Shanghai")
+# 数据覆盖上界要扣掉的结算缓冲天数。
+# 与引擎的 `facts.DEFAULT_ATTR_EXCLUDE_DAYS = 2` 保持一致：引擎从不用最后两天
+# 做判定（Amazon 当天读数会反复上修），收敛器拿同一条线，两边口径才不打架。
+# 扣在覆盖上界上，而不是在每条断言的窗口上逐个裁 —— 裁窗口等于偷偷把断言改短，
+# 判出来的 correct 是假的；扣上界只影响「什么时候判」，不改「判什么」。
+SETTLE_EXCLUDE_DAYS = 2
 PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "converge_v1.md"
 PROMPT_VER = hashlib.sha1(PROMPT_PATH.read_bytes()).hexdigest()[:8] if PROMPT_PATH.exists() else "00000000"
 
@@ -195,12 +201,25 @@ def _reap_stale(conn: sqlite3.Connection, minutes: int = STALE_RUN_MINUTES) -> i
 # ------------------------------------------------------------------ 数据覆盖
 
 def _coverage(conn: sqlite3.Connection) -> tuple[str | None, str | None]:
-    """三张 fact 表合起来的实际数据日期区间。
+    """三张 fact 表合起来的**可用**数据日期区间（上界已经扣掉结算缓冲）。
 
     为什么要取三张表的并集而不是各自记：
     断言可能横跨 campaign / keyword / placement 三个粒度，
     判定时只关心「这一天到底有没有事实」，不关心是哪张表给的。
     只要有一张表覆盖到，就不该因为另一张表缺而判 unverifiable。
+
+    **为什么要扣掉最后几天（2026-11-26 修）**：
+    早先这里直接返回 `max(report_date)`，于是「数据到 11-24」被当成
+    「11-24 这一天是完整的一天」。但 Amazon 报表是 T+1 出、且当天读数会反复
+    上修 —— 生产库里 11-23 的同一天读数从 154 击涨到 378 击、11-24 当天只有
+    159 击（前后两天是 378/490）。拿这种半截日当完整日，会把「累计到 11-24
+    的 orders」判成 1 单，而真实值至少是 5 单 —— 断言该 correct 的被判 wrong。
+    这不是「数据还没到」（那种要保持 pending 等），而是「数据到了但还没长完」，
+    所以必须在覆盖上界里就把它扣掉，而不是等 ingest 追平。
+    缓冲天数与引擎口径对齐（`facts.DEFAULT_ATTR_EXCLUDE_DAYS = 2`）：引擎自己
+    也从不用最后两天做判定，收敛器用同一条线，两边才不会互相打脸。
+
+    返回的第二个值因此是「可以拿来做判定的最后一天」，不是「库里有数据的最后一天」。
     """
     row = conn.execute(
         """
@@ -216,7 +235,17 @@ def _coverage(conn: sqlite3.Connection) -> tuple[str | None, str | None]:
     ).fetchone()
     if not row or not row["d_min"]:
         return None, None
-    return row["d_min"], row["d_max"]
+    d_max = row["d_max"]
+    if d_max:
+        try:
+            d_max = (date.fromisoformat(d_max) - timedelta(days=SETTLE_EXCLUDE_DAYS)).isoformat()
+        except ValueError:  # 库里存了非 ISO 日期时别把整轮判死，退回原值
+            pass
+        if d_max < row["d_min"]:
+            # 数据本来就只有一两天，扣完就空了 —— 上界收到起点，宁可全判 pending
+            d_max = row["d_min"]
+    return row["d_min"], d_max
+
 
 
 # ------------------------------------------------------------------ 窗口与实体解析
@@ -470,6 +499,34 @@ def _cmp(value: float, op: str, target: float) -> bool:
     return abs(value - target) < 1e-9
 
 
+# 断言阈值的物理边界。没有这一层，正则抓到什么就信什么：
+#   `cost ≥ 999999999999 且 orders ≤ 0` → 恒判 wrong（永远花不到一万亿）
+#   `clicks ∈ [0, 0]`                   → 恒判 correct（任何点击都「在区间内」）
+#   `cvr < 99999%`                      → 9.9999，比任何真实转化率都大，恒 correct
+# 三种都会静默污染 agent_eval 的兑现率 —— 而兑现率是人判断「这个 agent 靠不靠谱」
+# 的唯一依据，污染它等于让人拿假数据做去留决定。
+# 边界按「这条业务里可能出现的极限」给，不是按数学极限：
+#   cost/clicks/orders/impressions 是计数，负数无意义；
+#   cvr/acos 是比率，>10 倍（1000%）的断言只可能来自解析错误或打字错误。
+# 越界一律返回 []（让模型接手），不做钳位 —— 钳到边界会造出一个「看起来能判」
+# 的假断言，比不判更糟。
+CLAUSE_BOUNDS: dict[str, tuple[float, float]] = {
+    "cost":        (0.0, 1e6),
+    "sales":       (0.0, 1e7),
+    "orders":      (0.0, 1e5),
+    "clicks":      (0.0, 1e7),
+    "impressions": (0.0, 1e9),
+    "cpc":         (0.0, 100.0),
+    "cvr":         (0.0, 10.0),
+    "acos":        (0.0, 10.0),
+}
+
+
+def _bound_ok(metric: str, value: float) -> bool:
+    lo, hi = CLAUSE_BOUNDS.get(metric, (float("-inf"), float("inf")))
+    return lo <= value <= hi
+
+
 def _parse_clauses(expected: str) -> list[tuple[str, str, float]]:
     """把 expected 拆成若干 (metric, op, threshold) 合取项。
 
@@ -488,8 +545,15 @@ def _parse_clauses(expected: str) -> list[tuple[str, str, float]]:
         metric = _METRIC_ALIAS.get(re.sub(r"\s+", " ", m.group(1)).strip())
         if not metric:
             return []
-        out.append((metric, "ge", float(m.group(2))))
-        out.append((metric, "le", float(m.group(3))))
+        lo_v, hi_v = float(m.group(2)), float(m.group(3))
+        if not (_bound_ok(metric, lo_v) and _bound_ok(metric, hi_v)):
+            return []
+        # 退化区间（[0, 0] / [5, 5] 这种）恒真，任何数据都能「通过」，
+        # 于是判出 correct —— 这不是证据，是恒等式。同理 lo > hi 是打字错误。
+        if lo_v >= hi_v:
+            return []
+        out.append((metric, "ge", lo_v))
+        out.append((metric, "le", hi_v))
     for m in _CLAUSE.finditer(expected):
         raw = re.sub(r"\s+", " ", m.group(1)).strip()
         metric = _METRIC_ALIAS.get(raw)
@@ -501,9 +565,17 @@ def _parse_clauses(expected: str) -> list[tuple[str, str, float]]:
         val = float(m.group(3))
         if m.group(4) == "%":
             val = val / 100.0
-        # CVR 写成 0.010 或 1% 两种都见过，统一成小数
-        if metric == "cvr" and val > 1.0:
+        elif metric == "cvr" and val >= 1.0:
+            # 裸数字写 CVR 时，`cvr < 1` 意思是 1% 而不是 100% —— 按 1% 算，
+            # 判得比字面更严，不会把「转化率 0.5%」错判成满足 `< 1.0`。
+            # 注意只在**没有 %** 时才折：`cvr < 1%` 上面已经折成 0.01，
+            # 再折一次就变成 0.0001。这个双重折算真踩过 ——
+            # `cvr < 99999%` 被折成 9.9999 落进上界内，恒判 correct。
             val = val / 100.0
+        # 注意：百分数已折成小数（`cvr < 99999%` → 999.99），这里按折后的值判边界，
+        # 所以 cvr 的上界 10.0 同时挡住「1000% 以上」和「忘了折的 99999」两种写法。
+        if not _bound_ok(metric, val):
+            return []
         out.append((metric, op, val))
     return out
 
@@ -549,7 +621,7 @@ def _gate(state: str, win, cov, clauses, agg) -> tuple[str, str] | None:
     if state == "covered":
         return None
     if state == "future":
-        return ("pending", f"断言窗口 {_win_text(win)} 尚无任何事实数据（数据止于 {cov[1]}），本轮不判")
+        return ("pending", f"断言窗口 {_win_text(win)} 尚无任何事实数据（可用数据止于 {cov[1]}（已扣 {SETTLE_EXCLUDE_DAYS} 天结算缓冲）），本轮不判")
     if clauses and all(metric in _MONOTONE for metric, _, _ in clauses):
         crossed_all = True
         for metric, op, thr in clauses:
@@ -562,7 +634,7 @@ def _gate(state: str, win, cov, clauses, agg) -> tuple[str, str] | None:
             return None
     return (
         "pending",
-        f"断言窗口 {_win_text(win)} 未走完（数据止于 {cov[1]}），"
+        f"断言窗口 {_win_text(win)} 未走完（可用数据止于 {cov[1]}（已扣 {SETTLE_EXCLUDE_DAYS} 天结算缓冲）），"
         f"已覆盖部分不足以定论，本轮不判，等 ingest 追平后自动重判",
     )
 
@@ -790,11 +862,19 @@ def _ev_binom(conn, row, exp, win, ents, cov, state):
         label = f"{agg['label']} {agg['window'][0]}~{agg['window'][1]}"
     if n <= 0:
         return ("unverifiable", f"{label} clicks=0，二项检验无定义")
-    p_val = min(1.0, 2.0 * facts._binom_cdf(k, n, p0))
+    # 精确双侧二项检验：2 × min(左尾, 右尾)，再钳到 1。
+    # 早先只取 2 × 左尾 —— CVR 上升时左尾本来就接近 1，钳完恒等于 1.0，
+    # 于是「p < 0.05 → 显著变好」这类断言永远判 wrong。实测
+    # clicks=300 / orders=6 / p0=0.005：左尾 0.9991 → 老式 p=1.0，
+    # 而正确的双侧 p≈0.0018，结论正好相反。
+    left = facts._binom_cdf(k, n, p0)      # P(X ≤ k)：出得比基线少
+    right = facts._binom_sf(k, n, p0)      # P(X ≥ k)：出得比基线多
+    p_val = min(1.0, 2.0 * min(left, right))
     ok = all(_cmp(p_val, op, thr) for _, op, thr in clauses)
     return (
         "correct" if ok else "wrong",
-        f"{label} clicks={n} orders={k} p0={p0} → 双侧 p={p_val:.4f}",
+        f"{label} clicks={n} orders={k} p0={p0} → 双侧 p={p_val:.4f}"
+        f"（左尾={left:.4f} 右尾={right:.4f}）",
     )
 
 
@@ -853,7 +933,7 @@ def _ev_decision_log(conn, row, exp, win, ents, cov, state):
             if state != "covered":
                 return (
                     "pending",
-                    f"断言窗口 {_win_text(win)} 未走完（数据止于 {cov[1]}），"
+                    f"断言窗口 {_win_text(win)} 未走完（可用数据止于 {cov[1]}（已扣 {SETTLE_EXCLUDE_DAYS} 天结算缓冲）），"
                     f"当前已执行 0 条但窗口内仍可能新增，本轮不判",
                 )
             return (
@@ -903,7 +983,7 @@ def _ev_decision_log(conn, row, exp, win, ents, cov, state):
     if state != "covered":
         return (
             "pending",
-            f"断言窗口 {_win_text(win)} 未走完（数据止于 {cov[1]}），"
+            f"断言窗口 {_win_text(win)} 未走完（可用数据止于 {cov[1]}（已扣 {SETTLE_EXCLUDE_DAYS} 天结算缓冲）），"
             f"decision_log 计数仍会变化；当前 {'; '.join(notes)}",
         )
     return (
@@ -1125,6 +1205,14 @@ def _ev_next_run(conn, row, exp, win, ents, cov, state):
     if m:
         left, right = m.group(1).lower(), m.group(2).lower()
         lo, hi = float(m.group(3)), float(m.group(4))
+        # 层间点击差值同样要设防：`[0, 0]` 恒真、`[5, 5]` 恒真、`lo > hi` 是打字错误。
+        # 差值不是单指标，用 clicks 的边界（两侧都是点击数，差值必然在 ±clicks 量级内）。
+        if not (_bound_ok("clicks", lo) and _bound_ok("clicks", hi)) or lo >= hi:
+            return (
+                "unverifiable",
+                f"层间差值区间 [{lo:g}, {hi:g}] 不是有效区间（下界须小于上界、且在点击数量级内），"
+                "这版断言无法按数值核算，交给人看",
+            )
         lay = {str(x.get("layer") or "").lower(): x for x in (nxt.get("layer_evidence") or [])}
         if left not in lay or right not in lay:
             return (
@@ -1584,7 +1672,7 @@ def _judge_one_objection(conn, obj, cov) -> tuple[str, str, str]:
             # 数据没追平 —— 这是临时状态，必须保持 pending 等下一轮
             return (
                 "pending",
-                f"[预测 {len(verdicts) + 1}] 窗口 {_win_text(win)} 未走完（数据止于 {cov[1]}），"
+                f"[预测 {len(verdicts) + 1}] 窗口 {_win_text(win)} 未走完（可用数据止于 {cov[1]}（已扣 {SETTLE_EXCLUDE_DAYS} 天结算缓冲）），"
                 f"且没有确定性判定器能解析这条预测，本轮不判",
                 "rule:gate",
             )
@@ -1959,7 +2047,7 @@ def judge_assumptions(conn, *, as_of: str, dry_run: bool = False,
         if _window_state(win, cov) != "covered":
             stats["n_assumption_deferred"] += 1
             row["result"] = "deferred"
-            row["why"] = (f"复核窗口 {_win_text(win)} 未走完（数据止于 {cov[1]}），"
+            row["why"] = (f"复核窗口 {_win_text(win)} 未走完（可用数据止于 {cov[1]}（已扣 {SETTLE_EXCLUDE_DAYS} 天结算缓冲）），"
                           f"本轮不判，等 ingest 追平后自动重判")
             rows_out.append(row)
             print(f"  A#{aid:<4} review={end}  [gate]  → 本轮不判（数据未追平，下轮自动重判）")
@@ -2045,7 +2133,13 @@ def judge_assumptions(conn, *, as_of: str, dry_run: bool = False,
                 "policy_type": ptype,
                 "scope": scope,
                 "object_id": oid,
-                "status": "draft",          # 必须等人到策略页点批准才 active
+                # 状态必须是 proposed，不是 draft。
+                # policy 表在整条链里只有一个「等人认领」状态就是 proposed
+                # （attribute.py 的归因提案也写 proposed；工作台 /policy/pending
+                # 只查 proposed，/policy/{id}/activate 也只认 proposed）。
+                # 早先这里写 draft，结果 converge 攒出的草案在策略页永远不出现、
+                # 也永远认领不了 —— 写了等于没写，人根本看不到。
+                "status": "proposed",
                 "source": "agent_converge",
                 "evidence_text": why[:500],
                 "params_json": {
@@ -2083,7 +2177,7 @@ def judge_assumptions(conn, *, as_of: str, dry_run: bool = False,
                     cur = conn.execute(
                         "insert into policy (scope, object_id, policy_type, params_json, "
                         "source, evidence_text, status, created_at) "
-                        "values (?,?,?,?,?,?,'draft',?)",
+                        "values (?,?,?,?,?,?,'proposed',?)",
                         (scope, oid, ptype,
                          json.dumps(proposal["params_json"], ensure_ascii=False),
                          "agent_converge", why[:500], now))
@@ -2127,8 +2221,9 @@ def judge_assumptions(conn, *, as_of: str, dry_run: bool = False,
                     # 用 lastrowid 精确定位自己插的那一条，不会误删对方的。
                     pid = (row.get("policy_proposal") or {}).get("policy_id")
                     if pid:
-                        conn.execute("delete from policy where policy_id=? and status='draft'",
-                                     (pid,))
+                        conn.execute(
+                            "delete from policy where policy_id=? and status='proposed'",
+                            (pid,))
                         row["policy_proposal"]["note"] = "并发抢输，草案已回退"
                         stats["n_policy_drafted"] -= 1
 
@@ -2289,7 +2384,7 @@ def run_once(
             # 实测 #56（due 11-20，method 没写日期区间）就是这么被钉的。
             verdict, actual, who = (
                 "pending",
-                f"断言窗口 {_win_text(win)} 未走完（数据止于 {cov[1]}），"
+                f"断言窗口 {_win_text(win)} 未走完（可用数据止于 {cov[1]}（已扣 {SETTLE_EXCLUDE_DAYS} 天结算缓冲）），"
                 f"确定性判定器无法锁定结论，本轮不问模型，等 ingest 追平后自动重判",
                 "gate",
             )

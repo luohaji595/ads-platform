@@ -73,24 +73,33 @@ def _render_policy(conn) -> str:
 
 def _render_excluded(conn) -> str:
     lines = [f"# 定了不做的事", f"", f"- 投影日：{_today()} Asia/Shanghai", ""]
+    # 这张表只有 5 列：excluded_id / object_id / reason_code / created_at / expires_at。
+    # 早先这里 SELECT 了不存在的 evidence_text，被下面的 except 吞掉后整段变成
+    # 「reason_excluded 暂无行」—— 用户划掉的每一条方向静默消失，系统永不报错。
+    # 现在按真实列查，且失败时把错误写进输出（不再伪装成「没有数据」）。
+    err = ""
     try:
         ex = conn.execute(
-            """SELECT object_id, reason_code, evidence_text, created_at, expires_at
+            """SELECT object_id, reason_code, created_at, expires_at
                FROM reason_excluded ORDER BY excluded_id DESC"""
         ).fetchall()
-    except sqlite3.Error:
+    except sqlite3.Error as e:
         ex = []
+        err = f"{type(e).__name__}: {e}"
     lines.append("## 显式排除")
     lines.append("")
-    if not ex:
+    if err:
+        lines.append(f"（读 reason_excluded 失败：{err}）")
+        lines.append("")
+    elif not ex:
         lines.append("（reason_excluded 暂无行。）")
         lines.append("")
     else:
-        keys = ["object_id", "reason_code", "evidence_text", "created_at", "expires_at"]
+        keys = ["object_id", "reason_code", "created_at", "expires_at"]
         for r in ex:
             d = dict(r) if isinstance(r, sqlite3.Row) else dict(zip(keys, r))
             lines.append(
-                f"- {d['object_id']} / {d['reason_code']}：{d.get('evidence_text') or '—'} "
+                f"- {d['object_id']} / {d['reason_code']} "
                 f"（{d.get('created_at') or ''}，到期 {d.get('expires_at') or '无'}）"
             )
         lines.append("")
@@ -104,9 +113,14 @@ def _render_excluded(conn) -> str:
                WHERE status='rejected' AND (reject_reason IS NOT NULL OR reject_reason_code IS NOT NULL)
                ORDER BY checked_at DESC"""
         ).fetchall()
-    except sqlite3.Error:
+        rej_err = ""
+    except sqlite3.Error as e:
         rej = []
-    if not rej:
+        rej_err = f"{type(e).__name__}: {e}"
+    if rej_err:
+        lines.append(f"（读 decision_log 失败：{rej_err}）")
+        lines.append("")
+    elif not rej:
         lines.append("（没有带理由的否决。）")
         lines.append("")
     else:
@@ -135,8 +149,14 @@ def _render_daily(conn) -> str:
                ORDER BY checked_at""",
             (today,),
         ).fetchall()
-    except sqlite3.Error:
+        day_err = ""
+    except sqlite3.Error as e:
         rows = []
+        day_err = f"{type(e).__name__}: {e}"
+    if day_err:
+        lines.append(f"（读 decision_log 失败：{day_err}）")
+        lines.append("")
+        return "\n".join(lines)
     if not rows:
         lines.append("（今日还没有打钩或否决。）")
         lines.append("")

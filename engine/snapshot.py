@@ -29,7 +29,7 @@
     观测点数量天然被压成「一天一个」，再多次抓取也留不下痕迹。
 
 所以现在改成：
-    config_snapshot 的主键 = (snap_ts, snap_date, entity_type, entity_id, field)
+    config_snapshot 的主键 = (snap_ts, snap_date, entity_type, entity_id, market_id, field)
     snap_ts  = 这批配置被真正观测到的时刻（UTC，归一化到秒）
     snap_date = 这批配置取自哪一天的报表行（沿用旧口径，不破坏历史数据）
     diff 不再只比「最近两次」，而是把所有「相邻观测点」都比一遍。
@@ -118,6 +118,22 @@ def _utc_z(raw: str | None) -> str | None:
 
 # ---------------------------------------------------------------- 表结构迁移
 
+def _pk_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """读出一张表真正的主键列（按序号）。
+
+    为什么不 grep DDL 文本：主键可能是表级约束也可能写在列上，
+    文本匹配容易看漏；PRAGMA index_info 读的是编译后的真实索引。
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? "
+        "AND name LIKE 'sqlite_autoindex_%' LIMIT 1", (table,)
+    ).fetchone()
+    if not row:
+        return []
+    cols = conn.execute(f"PRAGMA index_info({row['name']})").fetchall()
+    return [r["name"] for r in sorted(cols, key=lambda r: r["seqno"])]
+
+
 def ensure_snapshot_schema(conn: sqlite3.Connection) -> bool:
     """把 config_snapshot 从「按日期唯一」升级成「按观测时刻唯一」。
 
@@ -125,59 +141,134 @@ def ensure_snapshot_schema(conn: sqlite3.Connection) -> bool:
       snap_ts = snap_date || 'T00:00:00Z'（占位：旧行只有日期粒度）
       legacy  = 1
 
-    幂等：已经有 snap_ts 列就直接返回。
+    幂等：已经有 snap_ts 列且主键包含 market_id 就直接返回。
     返回 True 表示这次真的迁移了。
 
-    注：engine/schema_v2.sql 里的 DDL 还是旧的。那边用 CREATE TABLE IF NOT EXISTS，
-    已有库不受影响；全新库第一次跑 take_snapshot 时会被这里自动升级成新结构。
+    注：engine/schema_v2.sql 已同步为 12 列 + 6 列主键，全新库直接建好新结构；
+    老库或半迁移库第一次跑 take_snapshot 时会被这里自动升级。
+
+    2026-11-26 追加：主键补上 market_id。
+    原主键 (snap_ts, snap_date, entity_type, entity_id, field) 少了市场维度。
+    entity_id 在同一市场内唯一，但跨市场不保证 —— 两个市场出现同一个 entity_id
+    （比如同一个 keyword_id 被两个账户共用、或将来接第二个店铺）时，
+    ON CONFLICT 会把第二个市场的值原地覆盖掉第一个市场的，
+    diff 拿到的「变更前」其实已经是「变更后」，于是**真实变更被漏检**。
+    生产库现在只有 market_id=7 一个市场，所以这条是潜伏缺陷；
+    接第二个店之前必须修掉，否则新店的配置变更会静默丢失。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(config_snapshot)")}
     if not cols:
         return False           # 表还不存在，交给 schema_v2.sql 建
     if "snap_ts" in cols:
-        return False           # 已经是新结构
+        # 已经是新结构。再看一眼主键里有没有 market_id —— 没有就再升一次。
+        if "market_id" in _pk_columns(conn, "config_snapshot"):
+            return False
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("ALTER TABLE config_snapshot RENAME TO _config_snapshot_v1")
+            conn.execute(
+                """
+                CREATE TABLE config_snapshot (
+                    snap_ts       TEXT    NOT NULL,
+                    snap_date     TEXT    NOT NULL,
+                    legacy        INTEGER NOT NULL DEFAULT 0,
+                    entity_type   TEXT    NOT NULL,
+                    entity_id     TEXT    NOT NULL,
+                    market_id     INTEGER,
+                    campaign_id   TEXT,
+                    ad_group_id   TEXT,
+                    entity_label  TEXT,
+                    field         TEXT    NOT NULL,
+                    value         TEXT,
+                    captured_at   TEXT    NOT NULL,
+                    PRIMARY KEY (snap_ts, snap_date, entity_type, entity_id, market_id, field)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO config_snapshot
+                    (snap_ts, snap_date, legacy, entity_type, entity_id, market_id,
+                     campaign_id, ad_group_id, entity_label, field, value, captured_at)
+                SELECT snap_ts, snap_date, legacy, entity_type, entity_id, market_id,
+                       campaign_id, ad_group_id, entity_label, field, value, captured_at
+                FROM _config_snapshot_v1
+                """
+            )
+            conn.execute("DROP TABLE _config_snapshot_v1")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_snap_entity "
+                "ON config_snapshot(entity_type, entity_id, snap_date)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_snap_ts ON config_snapshot(snap_ts)"
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        _ensure_diff_state(conn)
+        return True
 
-    conn.execute("ALTER TABLE config_snapshot RENAME TO _config_snapshot_legacy")
-    conn.execute(
-        """
-        CREATE TABLE config_snapshot (
-            snap_ts       TEXT    NOT NULL,   -- 观测时刻（UTC，归一化到秒）——真正的身份
-            snap_date     TEXT    NOT NULL,   -- 这批配置取自哪一天的报表行（旧口径）
-            legacy        INTEGER NOT NULL DEFAULT 0,  -- 1 = 迁移前的旧行，只有日期粒度
-            entity_type   TEXT    NOT NULL,
-            entity_id     TEXT    NOT NULL,
-            market_id     INTEGER,
-            campaign_id   TEXT,
-            ad_group_id   TEXT,
-            entity_label  TEXT,
-            field         TEXT    NOT NULL,
-            value         TEXT,
-            captured_at   TEXT    NOT NULL,
-            PRIMARY KEY (snap_ts, snap_date, entity_type, entity_id, field)
+    # ---- 分支 B：老库，连 snap_ts 都没有。整表重建成新结构。
+    #
+    # 这里必须和分支 A 建出**同一个**表：12 列 + 6 列主键。
+    # 2026-11-26 实测踩过：这一段原来漏了主键里的 market_id（写成 5 列），
+    # 于是全新库第一次 take_snapshot 走完迁移，紧接着的
+    # `ON CONFLICT(snap_ts, snap_date, entity_type, entity_id, market_id, field)`
+    # 对不上唯一约束，抛
+    # `OperationalError: ON CONFLICT clause does not match any PRIMARY KEY`。
+    # 全新库必崩，而且崩在第一次快照 —— 也就是刚接新店的第一天。
+    #
+    # 整段包在显式事务里：sqlite3 模块只在 DML 前隐式开事务，DDL 是自动提交的，
+    # 所以 RENAME 和 INSERT 之间崩掉会留下「有 _config_snapshot_legacy、没有
+    # config_snapshot」的半截库。下面用 BEGIN IMMEDIATE 手动兜住。
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("ALTER TABLE config_snapshot RENAME TO _config_snapshot_legacy")
+        conn.execute(
+            """
+            CREATE TABLE config_snapshot (
+                snap_ts       TEXT    NOT NULL,   -- 观测时刻（UTC，归一化到秒）——真正的身份
+                snap_date     TEXT    NOT NULL,   -- 这批配置取自哪一天的报表行（旧口径）
+                legacy        INTEGER NOT NULL DEFAULT 0,  -- 1 = 迁移前的旧行，只有日期粒度
+                entity_type   TEXT    NOT NULL,
+                entity_id     TEXT    NOT NULL,
+                market_id     INTEGER,
+                campaign_id   TEXT,
+                ad_group_id   TEXT,
+                entity_label  TEXT,
+                field         TEXT    NOT NULL,
+                value         TEXT,
+                captured_at   TEXT    NOT NULL,
+                PRIMARY KEY (snap_ts, snap_date, entity_type, entity_id, market_id, field)
+            )
+            """
         )
-        """
-    )
-    conn.execute(
-        """
-        INSERT INTO config_snapshot
-            (snap_ts, snap_date, legacy, entity_type, entity_id, market_id,
-             campaign_id, ad_group_id, entity_label, field, value, captured_at)
-        SELECT snap_date || 'T00:00:00Z', snap_date, 1,
-               entity_type, entity_id, market_id,
-               campaign_id, ad_group_id, entity_label, field, value, captured_at
-        FROM _config_snapshot_legacy
-        """
-    )
-    # 先 DROP 旧表（连带它名下的 ix_snap_entity），再建索引，否则索引名冲突
-    conn.execute("DROP TABLE _config_snapshot_legacy")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS ix_snap_entity "
-        "ON config_snapshot(entity_type, entity_id, snap_date)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS ix_snap_ts ON config_snapshot(snap_ts)"
-    )
-    conn.commit()
+        conn.execute(
+            """
+            INSERT INTO config_snapshot
+                (snap_ts, snap_date, legacy, entity_type, entity_id, market_id,
+                 campaign_id, ad_group_id, entity_label, field, value, captured_at)
+            SELECT snap_date || 'T00:00:00Z', snap_date, 1,
+                   entity_type, entity_id, market_id,
+                   campaign_id, ad_group_id, entity_label, field, value, captured_at
+            FROM _config_snapshot_legacy
+            """
+        )
+        # 先 DROP 旧表（连带它名下的 ix_snap_entity），再建索引，否则索引名冲突
+        conn.execute("DROP TABLE _config_snapshot_legacy")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_snap_entity "
+            "ON config_snapshot(entity_type, entity_id, snap_date)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_snap_ts ON config_snapshot(snap_ts)"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     _ensure_diff_state(conn)
     return True
 
@@ -351,7 +442,7 @@ def take_snapshot(conn: sqlite3.Connection, snap_date: str | None = None) -> dic
             (snap_ts, snap_date, legacy, entity_type, entity_id, market_id,
              campaign_id, ad_group_id, entity_label, field, value, captured_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(snap_ts, snap_date, entity_type, entity_id, field)
+        ON CONFLICT(snap_ts, snap_date, entity_type, entity_id, market_id, field)
         DO UPDATE SET value = excluded.value
         """,
         payload,
@@ -441,6 +532,7 @@ def _diff_pair(conn: sqlite3.Connection, a: dict, b: dict) -> dict:
         JOIN config_snapshot b
           ON a.entity_type = b.entity_type
          AND a.entity_id   = b.entity_id
+         AND a.market_id   IS b.market_id
          AND a.field       = b.field
         WHERE a.snap_ts = ? AND b.snap_ts = ?
           AND COALESCE(a.value,'') <> COALESCE(b.value,'')

@@ -13,6 +13,35 @@ export type Health = { ok: boolean; api_version?: number; db: string; db_exists:
 
 export const getHealth = () => get<Health>('/health')
 
+function formatErrorDetail(detail: unknown): string | null {
+  if (!detail) return null
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (typeof item === 'string') return item
+        if (item && typeof item === 'object') {
+          const rec = item as { loc?: unknown[]; msg?: unknown }
+          const loc = Array.isArray(rec.loc)
+            ? rec.loc.filter((x) => x !== 'body' && x !== 'query' && x !== 'path').join('.')
+            : ''
+          const msg = rec.msg != null ? String(rec.msg) : JSON.stringify(item)
+          return loc ? `${loc}: ${msg}` : msg
+        }
+        return String(item)
+      })
+      .filter(Boolean)
+    return parts.length ? parts.join('；') : null
+  }
+  if (typeof detail === 'object') {
+    const rec = detail as { message?: unknown; error?: unknown }
+    if (typeof rec.message === 'string') return rec.message
+    if (typeof rec.error === 'string') return rec.error
+    return JSON.stringify(detail)
+  }
+  return String(detail)
+}
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(BASE + path, {
     headers: { 'Content-Type': 'application/json' },
@@ -25,7 +54,10 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
   } catch {
     body = { detail: text }
   }
-  if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`)
+  if (!r.ok) {
+    const detail = formatErrorDetail(body?.detail)
+    throw new Error(detail || `HTTP ${r.status}`)
+  }
   return body as T
 }
 
@@ -127,6 +159,13 @@ export type OptionMeta = {
 
 export type Question = {
   id: string
+  /**
+   * 奏折内唯一的位置标识（形如 `Q01#2`）。`id` 只是题号，
+   * 同一份奏折里会重复（Q01 可以问 3 个不同的词），
+   * 打钩时要用 qkey 定位，否则永远命中第一道同号题。
+   * 老奏折没有这个字段 —— 前端回退到 id。
+   */
+  qkey?: string
   object: string
   ask: string
   options: string[]
@@ -666,7 +705,19 @@ export type PolicyRow = {
   expires_at: string | null
 }
 
-export type PolicyList = { policies: PolicyRow[]; note: string | null }
+/**
+ * `/policy/active` 比 `/policy/pending` 多一个 `expired`：过期条目单独列出来，
+ * 而不是藏掉 —— 「这条规矩消失了」和「还在库里只是不再执行」处置完全不同。
+ * 做成可选是因为 pending 那个端点不返回它。
+ *
+ * 注意：这个端点目前前端没有任何调用点（`getPolicyActive` 定义了但没人用），
+ * 所以「当前规矩」面板其实还没建。类型先按真实响应写，等面板建起来时不用改。
+ */
+export type PolicyList = {
+  policies: PolicyRow[]
+  expired?: PolicyRow[]
+  note: string | null
+}
 
 export const getPolicyPending = () => get<PolicyList>('/policy/pending')
 export const getPolicyActive = () => get<PolicyList>('/policy/active')

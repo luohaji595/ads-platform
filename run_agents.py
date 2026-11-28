@@ -366,7 +366,11 @@ def run_subprocess(job: str, db: Path, extra: list[str]) -> dict:
                               text=True, timeout=3600)
         out, code = proc.stdout or "", proc.returncode
     except subprocess.TimeoutExpired as exc:
-        out, code = (exc.stdout or "") + "\n[run_agents] 超时 3600s", 124
+        # 同 chain.py：TimeoutExpired.stdout 可能是 bytes，直接拼接会 TypeError。
+        raw = exc.stdout
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        out, code = (raw or "") + "\n[run_agents] 超时 3600s", 124
     tail = "\n".join(out.strip().splitlines()[-6:])
     return {"ok": code == 0, "error": None if code == 0 else f"退出码 {code}",
             "n_eval": 0, "n_objection": 0,

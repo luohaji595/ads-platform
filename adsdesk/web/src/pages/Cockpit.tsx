@@ -29,6 +29,11 @@ function isErr(x: any): x is { error: string } {
   return x && typeof x.error === 'string'
 }
 
+function shortDate(d: string | null | undefined): string {
+  if (!d) return '—'
+  return d.length >= 10 && d[4] === '-' && d[7] === '-' ? d.slice(5, 10) : d
+}
+
 /** 变化值按字段选格式：金额字段带 $，星级 1 位小数，其余按整数（名次/评论数/变体数）。 */
 function fmtMove(field: string, v: string | number | null | undefined): string {
   if (v == null || v === '') return '—'
@@ -109,14 +114,15 @@ export default function Cockpit({ signal }: { signal?: number }) {
 
   return (
     <div>
-      {/* 首屏六格：不看图也知道今天花了多少、赚不赚。图给趋势，数字给结论 ——
-          以前要滚到每张卡里各看一个 tag 才拼出全貌。 */}
+      {/* 首屏 KPI 格：不看图也知道当前花费、转化与待跟踪情况。 */}
       {!isErr(f) && (
         <div className="kpi-grid" style={{ marginBottom: 12 }}>
           <div className="kpi">
             <div className="k-label">花费</div>
             <div className="k-value">{fmtMoney(f.totals.cost)}</div>
-            <div className="k-extra">{f.window.start} ~ {f.window.end}</div>
+            <div className="k-extra" style={{ whiteSpace: 'nowrap' }} title={`${f.window.start} ~ ${f.window.end}`}>
+              {shortDate(f.window.start)} ~ {shortDate(f.window.end)}
+            </div>
           </div>
           <div className="kpi">
             <div className="k-label">销售额</div>
@@ -131,25 +137,26 @@ export default function Cockpit({ signal }: { signal?: number }) {
           <div className="kpi">
             <div className="k-label">ROAS</div>
             <div className="k-value">{roas == null ? '—' : `${roas.toFixed(2)}×`}</div>
-            <div className="k-extra">每花 1 块回来多少</div>
+            <div className="k-extra">每花 1 元回流</div>
           </div>
           <div className="kpi">
             <div className="k-label">CVR</div>
             <div className="k-value">{fmtPct(f.totals.cvr)}</div>
-            <div className="k-extra">{fmtInt(f.totals.clicks)} 击</div>
+            <div className="k-extra">{fmtInt(f.totals.clicks)} 次点击</div>
           </div>
           <div className="kpi">
             <div className="k-label">CPC</div>
             <div className="k-value">{f.totals.cpc == null ? '—' : `$${Number(f.totals.cpc).toFixed(2)}`}</div>
-            <div className="k-extra">每点击成本</div>
+            <div className="k-extra">每次点击成本</div>
           </div>
           <div className="kpi">
             <div className="k-label">待处理</div>
             <div className="k-value">{isErr(a) ? '—' : a.open_count}</div>
-            <div className="k-extra">条归因窗在跟踪</div>
+            <div className="k-extra">条归因观察中</div>
           </div>
         </div>
       )}
+
       {/* ① 账户漏斗趋势 */}
       <div className="card">
         <h2>
@@ -162,38 +169,33 @@ export default function Cockpit({ signal }: { signal?: number }) {
           <div className="err">{f.error}</div>
         ) : (
           <>
-            <div className="row" style={{ marginBottom: 8 }}>
-              <span className="tag">花费 {fmtMoney(f.totals.cost)}</span>
-              <span className="tag">点击 {fmtInt(f.totals.clicks)}</span>
-              <span className="tag">订单 {fmtInt(f.totals.orders)}</span>
-              <span className="tag">销售 {fmtMoney(f.totals.sales)}</span>
-              <span className="tag">CVR {fmtPct(f.totals.cvr)}</span>
-              <span className="tag">ACOS {fmtPct(f.totals.acos)}</span>
-              <span className="tag">CPC {f.totals.cpc == null ? '—' : `$${Number(f.totals.cpc).toFixed(2)}`}</span>
-            </div>
             <div className="small muted">
               每日花费
               {dates.length > IMMATURE_DAYS && (
-                <span className="muted"> · 右侧灰区是还没结算的最后 {IMMATURE_DAYS} 天</span>
+                <span className="muted"> · 右侧灰区为近 {IMMATURE_DAYS} 天未结算数据</span>
               )}
             </div>
-            <svg className="chart" viewBox={`0 0 ${W} ${70}`}>
-              <Line values={costs} width={W} height={70} color="#2563eb" labels={dates} format={fmtMoney} immature={IMMATURE_DAYS} />
-            </svg>
-            {/* ACOS 与 CVR 并排：它们共用一个横轴、量级都是百分比，竖着叠三张
-                等于让眼睛上下跑三趟才能把同一天的三个数对上。宽屏两列，窄屏自动回单列。 */}
+            <div className="chart-scroll">
+              <svg className="chart" viewBox={`0 0 ${W} ${70}`}>
+                <Line values={costs} width={W} height={70} color="var(--chart-1)" labels={dates} format={fmtMoney} immature={IMMATURE_DAYS} />
+              </svg>
+            </div>
             <div className="mini-grid">
               <div>
                 <div className="small muted">每日 ACOS</div>
-                <svg className="chart" viewBox={`0 0 ${MINI_W} ${MINI_H}`}>
-                  <Line values={acoss} width={MINI_W} height={MINI_H} color="#d97706" labels={dates} format={(v) => fmtPct(v)} immature={IMMATURE_DAYS} />
-                </svg>
+                <div className="chart-scroll mini">
+                  <svg className="chart" viewBox={`0 0 ${MINI_W} ${MINI_H}`}>
+                    <Line values={acoss} width={MINI_W} height={MINI_H} color="var(--chart-2)" labels={dates} format={(v) => fmtPct(v)} immature={IMMATURE_DAYS} />
+                  </svg>
+                </div>
               </div>
               <div>
                 <div className="small muted">每日 CVR</div>
-                <svg className="chart" viewBox={`0 0 ${MINI_W} ${MINI_H}`}>
-                  <Line values={cvrs} width={MINI_W} height={MINI_H} color="#0d9488" labels={dates} format={(v) => fmtPct(v)} immature={IMMATURE_DAYS} />
-                </svg>
+                <div className="chart-scroll mini">
+                  <svg className="chart" viewBox={`0 0 ${MINI_W} ${MINI_H}`}>
+                    <Line values={cvrs} width={MINI_W} height={MINI_H} color="var(--chart-3)" labels={dates} format={(v) => fmtPct(v)} immature={IMMATURE_DAYS} />
+                  </svg>
+                </div>
               </div>
             </div>
           </>
@@ -201,378 +203,397 @@ export default function Cockpit({ signal }: { signal?: number }) {
       </div>
 
       {/* ② 投放组合对比 */}
-      <div className="card">
-        <h2>
+      <details className="disclosure">
+        <summary>
           投放组合对比
-          <span className="sub">点估计 + 95% 区间 —— 区间不重叠才算真差别</span>
-        </h2>
-        {isErr(p) ? (
-          <div className="err">{p.error}</div>
-        ) : (
-          <svg className="chart" viewBox={`0 0 ${W} ${(p.portfolios || []).length * 24 + 8}`}>
-            {(p.portfolios || []).map((x: any, i: number) => (
-              <g key={x.name} transform={`translate(0, ${i * 24 + 2})`}>
-                <IntervalBar label={x.name} lo={x.cvr_lo} hi={x.cvr_hi} point={x.cvr} max={pfMax} width={W} />
-              </g>
-            ))}
-          </svg>
-        )}
-      </div>
+          {isErr(p) && <span className="disclosure-dot" />}
+          <span className="disclosure-sub">
+            {isErr(p)
+              ? '读取失败'
+              : `${(p.portfolios || []).length} 个组合 · 点估计与 95% 区间（不重叠才算真实差异）`}
+          </span>
+        </summary>
+        <div className="drawer-box">
+          {isErr(p) ? (
+            <div className="err">{p.error}</div>
+          ) : (
+            <div className="chart-scroll">
+              <svg className="chart" viewBox={`0 0 ${W} ${(p.portfolios || []).length * 24 + 8}`}>
+                {(p.portfolios || []).map((x: any, i: number) => (
+                  <g key={x.name} transform={`translate(0, ${i * 24 + 2})`}>
+                    <IntervalBar label={x.name} lo={x.cvr_lo} hi={x.cvr_hi} point={x.cvr} max={pfMax} width={W} />
+                  </g>
+                ))}
+              </svg>
+            </div>
+          )}
+        </div>
+      </details>
 
       {/* ③ 结构冲突 */}
-      <div className="card">
-        <h2>
+      <details className="disclosure">
+        <summary>
           结构冲突（同词多活动）
-          <span className="sub">
-            {isErr(c) ? '取不到' : `${c.conflict_count} 组 · 异常 ${c.abnormal_count} 个`}
+          {(isErr(c) || c.abnormal_count > 0) && <span className="disclosure-dot" />}
+          <span className="disclosure-sub">
+            {isErr(c) ? '读取失败' : `${c.conflict_count} 组 · 异常 ${c.abnormal_count} 个`}
           </span>
-        </h2>
-        {isErr(c) ? (
-          <div className="err">{c.error}</div>
-        ) : (c.conflicts || []).length === 0 ? (
-          <div className="note">没有同词多活动。</div>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>关键词 / 活动</th>
-                <th>最紧位次</th>
-                <th className="num">该位次点击</th>
-                <th className="num">该位次 CPC</th>
-                <th className="num">当日 bid × 溢价</th>
-                <th className="num">占该位次上限</th>
-                <th>判定</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(c.conflicts || []).map((g: any) =>
-                (g.campaigns || []).map((cp: CampaignInConflict, i: number) => (
-                  <tr key={`${g.keyword_text}-${cp.campaign_id}`}>
-                    <td>
-                      {i === 0 ? <b>{g.keyword_text}</b> : ''}
-                      <div className="small muted">{cp.campaign_name}</div>
-                      <div className="small muted">
-                        全位次均价 {cp.cpc_all_placements == null ? '—' : `$${cp.cpc_all_placements.toFixed(2)}`}
-                        {' · '}
-                        {fmtInt(cp.clicks)} 击 / {fmtInt(cp.orders)} 单 / {fmtMoney(cp.cost)}
-                      </div>
-                    </td>
-                    <td>
-                      {cp.tightest ? (
-                        <>
-                          <div className="small">{cp.tightest.placement.replace(' on-Amazon', '')}</div>
-                          <div className="small muted">{cp.tightest.report_date}</div>
-                        </>
-                      ) : (
-                        <span className="muted">—</span>
-                      )}
-                    </td>
-                    <td className="num">{cp.tightest ? fmtInt(cp.tightest.clicks) : '—'}</td>
-                    <td className="num">
-                      {cp.tightest ? `$${cp.tightest.cpc.toFixed(2)}` : '—'}
-                    </td>
-                    <td className="num">
-                      {cp.tightest ? (
-                        <>
-                          ${cp.tightest.bid.toFixed(2)} × {cp.tightest.bid_adjustment}%
-                          <span className="small muted"> = ${cp.tightest.cap.toFixed(2)}</span>
-                        </>
-                      ) : (
-                        '—'
-                      )}
-                    </td>
-                    <td className="num">{cp.tightest ? fmtPct(cp.tightest.ratio) : '—'}</td>
-                    <td>
-                      <span className={`tag ${cp.flag || 'unknown'}`}>
-                        {cp.flag === 'mismatch'
-                          ? '配置对不上'
-                          : cp.flag === 'near'
-                            ? '接近上限'
-                            : cp.flag === 'unknown'
-                              ? '无可判数据'
-                              : '正常'}
-                      </span>
-                      {cp.config_changed && (
-                        <div className="small muted">窗口内改过配置</div>
-                      )}
-                    </td>
-                  </tr>
-                )),
-              )}
-            </tbody>
-          </table>
-        )}
-        <div className="spacer" />
-        <div className="note">
-          逐日 × 逐位次算：<span className="mono">上限 = 当天 bid × (1 + 当天溢价%)</span>，
-          再拿那天的 <span className="mono">花费 ÷ 点击</span> 比它。<b>不用活动全位次均价比单个位次的上限</b>
-          ——混合均价会把风险稀释成假安全（`lat pulldown` 主活动全位次均价只有上限的 41%，它 TOS 那档是 100%）。
-          「配置对不上」= 比例超出 1：可能是当天改过配置，也可能是报表的溢价字段与当天实际配置不同步，
-          <b>不是「买超了平台上限」</b>，去核那一天。活动名里的「溢价1.4」是过期标签，真实值取
-          <span className="mono">fact_placement_daily.bid_adjustment</span>。
-        </div>
-      </div>
-
-      {/* ④ 关键词词族排行 */}
-      <div className="card">
-        <h2>
-          关键词词族排行
-          <span className="sub">按花费</span>
-        </h2>
-        {isErr(k) ? (
-          <div className="err">{k.error}</div>
-        ) : (
-          <svg className="chart" viewBox={`0 0 ${W} ${(k.keywords || []).length * 22 + 8}`}>
-            {(k.keywords || []).map((x: any, i: number) => (
-              <g key={x.keyword_text} transform={`translate(0, ${i * 22 + 2})`}>
-                <BarRow
-                  label={x.keyword_text}
-                  value={x.cost}
-                  max={kwMax}
-                  width={W}
-                  right={`${fmtMoney(x.cost)} / ${x.orders} 单`}
-                />
-              </g>
-            ))}
-          </svg>
-        )}
-      </div>
-
-      {/* ⑤ 外部市场变动 */}
-      <div className="card">
-        <h2>
-          外部市场变动
-          <span className="sub">
-            {isErr(m) ? '取不到' : m.status === 'connected' ? m.note || 'sorftime' : 'sorftime'}
-          </span>
-        </h2>
-        {isErr(m) ? (
-          <div className="err">{m.error}</div>
-        ) : m.status !== 'connected' ? (
-          // 表没建 / 表建了但没采到 —— 两种都如实说，别画空表假装有数据
-          <div className="note">{m.note || '还没接外部市场数据。'}</div>
-        ) : (
-          <>
+        </summary>
+        <div className="drawer-box">
+          {isErr(c) ? (
+            <div className="err">{c.error}</div>
+          ) : (c.conflicts || []).length === 0 ? (
+            <div className="note">没有同词多活动。</div>
+          ) : (
             <table>
               <thead>
                 <tr>
-                  <th>对象</th>
-                  <th>动作</th>
-                  <th className="num">数值变化</th>
-                  <th>观测</th>
+                  <th>关键词 / 活动</th>
+                  <th>最紧位次</th>
+                  <th className="num">该位次点击</th>
+                  <th className="num">该位次 CPC</th>
+                  <th className="num">当日 bid × 溢价</th>
+                  <th className="num">占该位次上限</th>
+                  <th>判定</th>
                 </tr>
               </thead>
               <tbody>
-                {(m.watched || []).map((w: MarketMove, i: number) => (
-                  <tr key={`${w.kind}-${w.subject}-${w.field}-${w.observed_at}-${i}`}>
-                    <td>
-                      <b>{w.subject}</b>
-                      <div className="small muted">
-                        {w.kind === 'competitor' ? '竞品' : 'ABA'}
-                        {w.label ? ` · ${w.label}` : ''}
-                      </div>
-                    </td>
-                    <td>
-                      <span className="tag">{w.move_label}</span>
-                      <div className="small muted">{w.field_label}</div>
-                    </td>
-                    <td className="num">
-                      {fmtMove(w.field, w.old_value)} → <b>{fmtMove(w.field, w.new_value)}</b>
-                      <div className="small muted">
-                        {fmtDelta(w.field, w.delta, w.move_type)}
-                        {/* ABA 名次必须带相对幅度：绝对值在长尾段没有可比性 */}
-                        {w.rel_pct != null ? ` · 占当前名次 ${w.rel_pct}%` : ''}
-                      </div>
-                    </td>
-                    <td>
-                      <div className="small">{w.observed_date || '—'}</div>
-                      {w.note ? <div className="small muted">{w.note}</div> : null}
-                    </td>
-                  </tr>
-                ))}
-                {(m.watched || []).length === 0 ? (
-                  <tr>
-                    <td colSpan={4} className="muted small">
-                      有数据但这两天竞品没动、名次也没跳 —— 空表本身是结论。
-                    </td>
-                  </tr>
-                ) : null}
+                {(c.conflicts || []).map((g: any) =>
+                  (g.campaigns || []).map((cp: CampaignInConflict, i: number) => (
+                    <tr key={`${g.keyword_text}-${cp.campaign_id}`}>
+                      <td>
+                        {i === 0 ? <b>{g.keyword_text}</b> : ''}
+                        <div className="small muted">{cp.campaign_name}</div>
+                        <div className="small muted">
+                          全位次均价 {cp.cpc_all_placements == null ? '—' : `$${cp.cpc_all_placements.toFixed(2)}`}
+                          {' · '}
+                          {fmtInt(cp.clicks)} 击 / {fmtInt(cp.orders)} 单 / {fmtMoney(cp.cost)}
+                        </div>
+                      </td>
+                      <td>
+                        {cp.tightest ? (
+                          <>
+                            <div className="small">{cp.tightest.placement.replace(' on-Amazon', '')}</div>
+                            <div className="small muted">{cp.tightest.report_date}</div>
+                          </>
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
+                      </td>
+                      <td className="num">{cp.tightest ? fmtInt(cp.tightest.clicks) : '—'}</td>
+                      <td className="num">
+                        {cp.tightest ? `$${cp.tightest.cpc.toFixed(2)}` : '—'}
+                      </td>
+                      <td className="num">
+                        {cp.tightest ? (
+                          <>
+                            ${cp.tightest.bid.toFixed(2)} × {cp.tightest.bid_adjustment}%
+                            <span className="small muted"> = ${cp.tightest.cap.toFixed(2)}</span>
+                          </>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                      <td className="num">{cp.tightest ? fmtPct(cp.tightest.ratio) : '—'}</td>
+                      <td>
+                        <span className={`tag ${cp.flag || 'unknown'}`}>
+                          {cp.flag === 'mismatch'
+                            ? '配置对不上'
+                            : cp.flag === 'near'
+                              ? '接近上限'
+                              : cp.flag === 'unknown'
+                                ? '无可判数据'
+                                : '正常'}
+                        </span>
+                        {cp.config_changed && (
+                          <div className="small muted">窗口内改过配置</div>
+                        )}
+                      </td>
+                    </tr>
+                  )),
+                )}
               </tbody>
             </table>
+          )}
+          <div className="spacer" />
+          <div className="note">
+            按逐日最紧位次测算点击成本与出价上限；「配置对不上」指实际扣费高于当日配置上限，建议核查当日记录。
+          </div>
+        </div>
+      </details>
 
-            {(m.aba || []).length > 0 ? (
-              <>
-                <div className="small muted" style={{ margin: '12px 0 4px' }}>
-                  自家搜索词的 ABA 名次（{m.latest_week || '—'}）· 前 {(m.aba || []).length} / 共 {m.aba_total ?? (m.aba || []).length} 个词
-                </div>
-                <table>
-                  <thead>
-                    <tr>
-                      <th className="num">ABA 名次</th>
-                      <th>搜索词</th>
-                      <th className="num">周变动</th>
-                      <th className="num">月搜索量</th>
-                      <th className="num">点击占比</th>
-                      <th className="num">Top3 品牌</th>
-                      <th className="num">建议竞价</th>
+      {/* ④ 关键词词族排行 */}
+      <details className="disclosure">
+        <summary>
+          关键词词族排行
+          {isErr(k) && <span className="disclosure-dot" />}
+          <span className="disclosure-sub">
+            {isErr(k) ? '读取失败' : `${(k.keywords || []).length} 个词族 · 按花费排序`}
+          </span>
+        </summary>
+        <div className="drawer-box">
+          {isErr(k) ? (
+            <div className="err">{k.error}</div>
+          ) : (
+            <div className="chart-scroll">
+              <svg className="chart" viewBox={`0 0 ${W} ${(k.keywords || []).length * 22 + 8}`}>
+                {(k.keywords || []).map((x: any, i: number) => (
+                  <g key={x.keyword_text} transform={`translate(0, ${i * 22 + 2})`}>
+                    <BarRow
+                      label={x.keyword_text}
+                      value={x.cost}
+                      max={kwMax}
+                      width={W}
+                      right={`${fmtMoney(x.cost)} / ${x.orders} 单`}
+                    />
+                  </g>
+                ))}
+              </svg>
+            </div>
+          )}
+        </div>
+      </details>
+
+      {/* ⑤ 外部市场变动 */}
+      <details className="disclosure">
+        <summary>
+          外部市场变动
+          {isErr(m) && <span className="disclosure-dot" />}
+          <span className="disclosure-sub">
+            {isErr(m)
+              ? '读取失败'
+              : m.status === 'connected'
+                ? `监测变动 ${(m.watched || []).length} 条 · 自家搜索词 ${m.aba_total ?? (m.aba || []).length} 个`
+                : m.note || '暂未接入外部市场数据'}
+          </span>
+        </summary>
+        <div className="drawer-box">
+          {isErr(m) ? (
+            <div className="err">{m.error}</div>
+          ) : m.status !== 'connected' ? (
+            <div className="note">{m.note || '还没接外部市场数据。'}</div>
+          ) : (
+            <>
+              <table>
+                <thead>
+                  <tr>
+                    <th>对象</th>
+                    <th>动作</th>
+                    <th className="num">数值变化</th>
+                    <th>观测</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(m.watched || []).map((w: MarketMove, i: number) => (
+                    <tr key={`${w.kind}-${w.subject}-${w.field}-${w.observed_at}-${i}`}>
+                      <td>
+                        <b>{w.subject}</b>
+                        <div className="small muted">
+                          {w.kind === 'competitor' ? '竞品' : 'ABA'}
+                          {w.label ? ` · ${w.label}` : ''}
+                        </div>
+                      </td>
+                      <td>
+                        <span className="tag">{w.move_label}</span>
+                        <div className="small muted">{w.field_label}</div>
+                      </td>
+                      <td className="num">
+                        {fmtMove(w.field, w.old_value)} → <b>{fmtMove(w.field, w.new_value)}</b>
+                        <div className="small muted">
+                          {fmtDelta(w.field, w.delta, w.move_type)}
+                          {w.rel_pct != null ? ` · 占当前名次 ${w.rel_pct}%` : ''}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="small">{w.observed_date || '—'}</div>
+                        {w.note ? <div className="small muted">{w.note}</div> : null}
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {(m.aba || []).map((a: MarketAbaRow) => (
-                      <tr key={`${a.week}-${a.term}`}>
-                        <td className="num">{a.rank == null ? '—' : a.rank}</td>
-                        <td>
-                          <b>{a.term}</b>
-                          {a.term_cn ? <div className="small muted">{a.term_cn}</div> : null}
-                        </td>
-                        <td className="num">{rankMove(a.rank_gain)}</td>
-                        <td className="num">{fmtInt(a.search_volume)}</td>
-                        <td className="num">
-                          {a.click_share == null ? '—' : `${a.click_share.toFixed(1)}%`}
-                        </td>
-                        <td className="num">
-                          {a.top3_brand_share == null ? '—' : `${a.top3_brand_share.toFixed(1)}%`}
-                        </td>
-                        <td className="num">{fmtMoney(a.cpc_bid)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </>
-            ) : null}
+                  ))}
+                  {(m.watched || []).length === 0 ? (
+                    <tr>
+                      <td colSpan={4} className="muted small">
+                        近两日竞品与搜索词名次暂无显著变动。
+                      </td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
 
-            {(m.markets || []).length > 0 ? (
-              <div className="small muted" style={{ marginTop: 10 }}>
-                最近行情：
-                {(m.markets || [])
-                  .slice(0, 4)
-                  .map((k: MarketDailyRow) => {
-                    const bits: string[] = []
-                    if (k.avg_price != null) bits.push(`均价 ${fmtMoney(k.avg_price)}`)
-                    if (k.price != null) bits.push(`售价 ${fmtMoney(k.price)}`)
-                    if (k.top3_brand_share != null) bits.push(`Top3 品牌 ${k.top3_brand_share.toFixed(1)}%`)
-                    if (k.subcategory_rank != null) bits.push(`子类第 ${k.subcategory_rank} 名`)
-                    if (k.top100_sales_volume != null) bits.push(`Top100 月销 ${fmtInt(k.top100_sales_volume)}`)
-                    return `${k.subject_name || k.subject_id}（${k.report_date}）${bits.join(' · ')}`
-                  })
-                  .join('；')}
-              </div>
-            ) : null}
-          </>
-        )}
-      </div>
+              {(m.aba || []).length > 0 ? (
+                <>
+                  <div className="small muted" style={{ margin: '12px 0 4px' }}>
+                    自家搜索词的 ABA 名次（{m.latest_week || '—'}）· 前 {(m.aba || []).length} / 共 {m.aba_total ?? (m.aba || []).length} 个词
+                  </div>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th className="num">ABA 名次</th>
+                        <th>搜索词</th>
+                        <th className="num">周变动</th>
+                        <th className="num">月搜索量</th>
+                        <th className="num">点击占比</th>
+                        <th className="num">Top3 品牌</th>
+                        <th className="num">建议竞价</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(m.aba || []).map((a: MarketAbaRow) => (
+                        <tr key={`${a.week}-${a.term}`}>
+                          <td className="num">{a.rank == null ? '—' : a.rank}</td>
+                          <td>
+                            <b>{a.term}</b>
+                            {a.term_cn ? <div className="small muted">{a.term_cn}</div> : null}
+                          </td>
+                          <td className="num">{rankMove(a.rank_gain)}</td>
+                          <td className="num">{fmtInt(a.search_volume)}</td>
+                          <td className="num">
+                            {a.click_share == null ? '—' : `${a.click_share.toFixed(1)}%`}
+                          </td>
+                          <td className="num">
+                            {a.top3_brand_share == null ? '—' : `${a.top3_brand_share.toFixed(1)}%`}
+                          </td>
+                          <td className="num">{fmtMoney(a.cpc_bid)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              ) : null}
+
+              {(m.markets || []).length > 0 ? (
+                <div className="small muted" style={{ marginTop: 10 }}>
+                  最近行情：
+                  {(m.markets || [])
+                    .slice(0, 4)
+                    .map((k: MarketDailyRow) => {
+                      const bits: string[] = []
+                      if (k.avg_price != null) bits.push(`均价 ${fmtMoney(k.avg_price)}`)
+                      if (k.price != null) bits.push(`售价 ${fmtMoney(k.price)}`)
+                      if (k.top3_brand_share != null) bits.push(`Top3 品牌 ${k.top3_brand_share.toFixed(1)}%`)
+                      if (k.subcategory_rank != null) bits.push(`子类第 ${k.subcategory_rank} 名`)
+                      if (k.top100_sales_volume != null) bits.push(`Top100 月销 ${fmtInt(k.top100_sales_volume)}`)
+                      return `${k.subject_name || k.subject_id}（${k.report_date}）${bits.join(' · ')}`
+                    })
+                    .join('；')}
+                </div>
+              ) : null}
+            </>
+          )}
+        </div>
+      </details>
 
       {/* ⑥ 位次（卡位） */}
       <RankPanel data={rank} />
 
       {/* ⑦ 归因窗追踪 */}
-      <div className="card">
-        <h2>
+      <details className="disclosure">
+        <summary>
           归因窗追踪
-          <span className="sub">
-            {isErr(a) ? '取不到' : `在跟踪 ${a.open_count} 条 · 已到期 ${a.due_count} 条`}
+          {(isErr(a) || a.due_count > 0) && <span className="disclosure-dot" />}
+          <span className="disclosure-sub">
+            {isErr(a)
+              ? '读取失败'
+              : `跟踪中 ${a.open_count} 条 · 已到期 ${a.due_count} 条 · 已回填 ${a.filled_count ?? (a.filled || []).length} 条`}
           </span>
-        </h2>
-        {isErr(a) ? (
-          <div className="err">{a.error}</div>
-        ) : (a.open || []).length === 0 ? (
-          <div className="note">
-            没有正在跟踪的动作。归因窗从「标已改」那一刻开始算，不是从打钩开始。
-          </div>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>对象</th>
-                <th>动作</th>
-                <th>改于</th>
-                <th>窗末</th>
-                <th>可结算</th>
-                <th className="num">距结算</th>
-                <th>状态</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(a.open || []).map((d: any) => (
-                <tr key={d.decision_id}>
-                  <td>{d.entity_label}</td>
-                  <td className="small">{d.action_type}</td>
-                  <td className="small muted">{(d.executed_at || '').slice(0, 16)}</td>
-                  {/* 窗末 ≠ 可结算：报表要过几天才把窗口最后几天回传齐，
-                      归因 agent 等到 settle_at 才动手。分两列写，免得
-                      「到期了怎么还没回填」这种误读。 */}
-                  <td className="small muted">{(d.attribution_due_at || '').slice(0, 16)}</td>
-                  <td className="small muted">{(d.settle_at || '—').slice(0, 16)}</td>
-                  <td className="num">{d.days_left ?? '—'}</td>
-                  <td>
-                    <span className={`tag ${d.overdue ? 'over' : 'ok'}`}>
-                      {d.overdue
-                        ? d.seen_7d
-                          ? '该看 14 天终局'
-                          : '该回填 7 天'
-                        : d.seen_7d
-                          ? '7 天已看，等终局'
-                          : '观察中'}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-
-        {/* 已回填：执行前 vs 执行后，扣掉同期全店那层 */}
-        {!isErr(a) && (a.filled || []).length > 0 && (
-          <>
-            <div className="small muted" style={{ margin: '14px 0 6px' }}>
-              已回填 {a.filled_count ?? (a.filled || []).length} 条 ——
-              比的是「相对全店」的变化，不是绝对数字。执行前后对比不是 A/B 测试。
+        </summary>
+        <div className="drawer-box">
+          {isErr(a) ? (
+            <div className="err">{a.error}</div>
+          ) : (a.open || []).length === 0 ? (
+            <div className="note">
+              没有正在跟踪的动作。标「已改」后将自动进入归因观察期。
             </div>
+          ) : (
             <table>
               <thead>
                 <tr>
                   <th>对象</th>
                   <th>动作</th>
-                  <th>回填于</th>
-                  <th>判定</th>
-                  <th>证据</th>
-                  <th>一句话</th>
+                  <th>改于</th>
+                  <th>窗末</th>
+                  <th>可结算</th>
+                  <th className="num">距结算</th>
+                  <th>状态</th>
                 </tr>
               </thead>
               <tbody>
-                {(a.filled || []).map((d: any) => {
-                  const o = d.outcome_14d || d.outcome_7d || {}
-                  const v = o.verdict || 'no_data'
-                  return (
-                    <tr key={d.decision_id}>
-                      <td>{d.entity_label}</td>
-                      <td className="small">{d.action_type}</td>
-                      <td className="small muted">
-                        {(d.outcome_filled_at || '').slice(0, 16)}
-                      </td>
-                      <td>
-                        <span className={`tag ${VERDICT_TAG[v] || ''}`}>
-                          {VERDICT_LABEL[v] || v}
-                        </span>
-                      </td>
-                      <td>
-                        {o.evidence_level
-                          ? (
-                            <span className={`tag ${LEVEL_TAG[o.evidence_level] || 'low'}`}>
-                              {LEVEL_LABEL[o.evidence_level] || o.evidence_level}
-                            </span>
-                          )
-                          : <span className="small muted">—</span>}
-                      </td>
-                      <td className="small">{o.why || o.basis || '—'}</td>
-                    </tr>
-                  )
-                })}
+                {(a.open || []).map((d: any) => (
+                  <tr key={d.decision_id}>
+                    <td>{d.entity_label}</td>
+                    <td className="small">{d.action_type}</td>
+                    <td className="small muted">{(d.executed_at || '').slice(0, 16)}</td>
+                    <td className="small muted">{(d.attribution_due_at || '').slice(0, 16)}</td>
+                    <td className="small muted">{(d.settle_at || '—').slice(0, 16)}</td>
+                    <td className="num">{d.days_left ?? '—'}</td>
+                    <td>
+                      <span className={`tag ${d.overdue ? 'over' : 'ok'}`}>
+                        {d.overdue
+                          ? d.seen_7d
+                            ? '该看 14 天终局'
+                            : '该回填 7 天'
+                          : d.seen_7d
+                            ? '7 天已看，等终局'
+                            : '观察中'}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
-          </>
-        )}
-      </div>
+          )}
+
+          {!isErr(a) && (a.filled || []).length > 0 && (
+            <>
+              <div className="small muted" style={{ margin: '14px 0 6px' }}>
+                已回填 {a.filled_count ?? (a.filled || []).length} 条（相对全店基准的执行前后对比）
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>对象</th>
+                    <th>动作</th>
+                    <th>回填于</th>
+                    <th>判定</th>
+                    <th>证据</th>
+                    <th>一句话</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(a.filled || []).map((d: any) => {
+                    const o = d.outcome_14d || d.outcome_7d || {}
+                    const v = o.verdict || 'no_data'
+                    return (
+                      <tr key={d.decision_id}>
+                        <td>{d.entity_label}</td>
+                        <td className="small">{d.action_type}</td>
+                        <td className="small muted">
+                          {(d.outcome_filled_at || '').slice(0, 16)}
+                        </td>
+                        <td>
+                          <span className={`tag ${VERDICT_TAG[v] || ''}`}>
+                            {VERDICT_LABEL[v] || v}
+                          </span>
+                        </td>
+                        <td>
+                          {o.evidence_level
+                            ? (
+                              <span className={`tag ${LEVEL_TAG[o.evidence_level] || 'low'}`}>
+                                {LEVEL_LABEL[o.evidence_level] || o.evidence_level}
+                              </span>
+                            )
+                            : <span className="small muted">—</span>}
+                        </td>
+                        <td className="small">{o.why || o.basis || '—'}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </>
+          )}
+        </div>
+      </details>
     </div>
   )
 }

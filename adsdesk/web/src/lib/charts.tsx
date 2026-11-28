@@ -14,7 +14,7 @@ export function Line({
   values,
   width,
   height,
-  color = '#2563eb',
+  color = 'var(--chart-1)',
   fill = true,
   immature = 0,
   labels,
@@ -74,10 +74,10 @@ export function Line({
       ))}
       {immature > 0 && (
         <>
-          <rect x={bandX} y={0} width={Math.max(0, width - bandX)} height={height} fill="#94a3b8" opacity={0.1}>
+          <rect x={bandX} y={0} width={Math.max(0, width - bandX)} height={height} fill="var(--chart-mute)" opacity={0.1}>
             <title>{`末 ${immature} 天报表还在回传归因，这几天不进判断`}</title>
           </rect>
-          <line className="dash" x1={bandX} y1={0} x2={bandX} y2={height} stroke="#94a3b8" strokeWidth={1} />
+          <line className="dash" x1={bandX} y1={0} x2={bandX} y2={height} stroke="var(--chart-mute)" strokeWidth={1} />
         </>
       )}
       {labels &&
@@ -100,7 +100,7 @@ export function IntervalBar({
   point,
   max,
   width,
-  color = '#0d9488',
+  color = 'var(--chart-3)',
 }: {
   label: string
   lo: number
@@ -137,7 +137,7 @@ export function BarRow({
   max,
   width,
   right,
-  color = '#2563eb',
+  color = 'var(--chart-1)',
 }: {
   label: string
   value: number
@@ -155,7 +155,7 @@ export function BarRow({
       <text x={0} y={H / 2 + 4} className="svg-label">
         {label.length > 26 ? label.slice(0, 26) + '…' : label}
       </text>
-      <rect x={labelW} y={H / 2 - 5} width={barW} height={10} fill="#eef1f5" rx={2} />
+      <rect x={labelW} y={H / 2 - 5} width={barW} height={10} fill="var(--bar-track)" rx={2} />
       <rect x={labelW} y={H / 2 - 5} width={w} height={10} fill={color} rx={2} />
       <text x={width - 70} y={H / 2 + 4} className="svg-label">
         {right}

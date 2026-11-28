@@ -43,7 +43,7 @@ FAIL_LOG = HERE / "data" / "market_fail.log"
 
 # 复用探针的连接层。sys.path 而不是复制一份代码：SSE/代理那些坑只有一处需要维护。
 sys.path.insert(0, str(ROOT / "tools"))
-from sorftime_probe import DEFAULT_URL, rpc  # noqa: E402
+from sorftime_probe import default_url, rpc  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 
@@ -252,8 +252,10 @@ class Client:
     """sorftime MCP 的薄封装：只负责 JSON-RPC 信封和 tools/call 的 content 拆包。
     连接层的坑（SSE 多行 data、本机代理）在 tools/sorftime_probe.py 里已解决。"""
 
-    def __init__(self, url: str = DEFAULT_URL, verbose: bool = False):
-        self.url = url
+    def __init__(self, url: str | None = None, verbose: bool = False):
+        # url=None 时延迟解析（环境变量 / ~/.config/sorftime/key / .env），
+        # 避免 import 期就去读密钥文件——测试和只读工具不该被迫配 key。
+        self.url = url or default_url()
         self.verbose = verbose
         self.calls = 0
         # 进程内缓存：aba 与 market 两个 dataset 都会调 keyword_detail，撞上同一个词时
@@ -328,8 +330,8 @@ class Client:
             return None
 
 
-def list_tools(url: str = DEFAULT_URL) -> list[dict]:
-    res = rpc(url, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+def list_tools(url: str | None = None) -> list[dict]:
+    res = rpc(url or default_url(), {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
     return res.get("tools") or []
 
 

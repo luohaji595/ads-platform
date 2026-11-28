@@ -5,16 +5,13 @@ import {
   getAgentObjections,
   getAgentRuns,
   getAgentSummary,
-  getPolicyPending,
-  activatePolicy,
-  rejectPolicy,
-  type PolicyRow,
   type AgentEvalByAgent,
   type AgentObjectionRow,
   type AgentObjectionSummary,
   type AgentRunRow,
   type AgentSummary,
 } from '../lib/api'
+import { PolicyList } from '../components/PolicyList'
 
 /**
  * Agent 账本。
@@ -241,93 +238,6 @@ function PredictCell({ o }: { o: AgentObjectionRow }) {
   )
 }
 
-// ───────────────────────── ⓪ 待认领的策略 ─────────────────────────
-
-/**
- * 归因 agent 只在「7/14 天对照实测有效」时才提案，攒不够就不出现 —— 所以这里
- * 大部分时候是空的，空态要写清为什么空，否则人会以为坏了。
- *
- * 认领＝写库（policy.status: proposed → active），引擎下次跑就按它行事；
- * 驳回＝留痕不生效。两者都只改 policy 表，不碰广告后台。
- */
-function PolicyCard({ signal }: { signal?: number }) {
-  const [rows, setRows] = useState<PolicyRow[] | null>(null)
-  const [note, setNote] = useState<string | null>(null)
-  const [err, setErr] = useState<string | null>(null)
-  const [busy, setBusy] = useState<number | null>(null)
-  const [msg, setMsg] = useState<string | null>(null)
-
-  const load = () => {
-    setErr(null)
-    getPolicyPending()
-      .then((r) => {
-        setRows(r.policies)
-        setNote(r.note)
-      })
-      .catch((e: unknown) => setErr(String((e as Error)?.message || e)))
-  }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(load, [])
-
-  // 常驻挂载：App 轮询到新数据时把 signal 加一，这里跟着重取（归因 agent 新提案要能自己冒出来）
-  useEffect(() => {
-    if (signal) load()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signal])
-
-  async function act(id: number, kind: 'activate' | 'reject') {
-    setBusy(id)
-    setMsg(null)
-    try {
-      if (kind === 'activate') await activatePolicy(id)
-      else await rejectPolicy(id)
-      setMsg(`policy #${id} 已${kind === 'activate' ? '认领，引擎下次跑就按它行事' : '驳回，不生效'}`)
-      load()
-    } catch (e: unknown) {
-      setMsg(`#${id} 失败：${String((e as Error)?.message || e)}`)
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  return (
-    <div className="card">
-      <h2>
-        待认领的策略
-        <span className="sub">归因实测有效才提案 —— 认领后引擎就按它行事</span>
-      </h2>
-      {err && <div className="err">读不到策略：{err}</div>}
-      {!err && !rows && <div className="note">读取中…</div>}
-      {rows && rows.length === 0 && <div className="note">{note || '没有待认领的策略。'}</div>}
-      {rows &&
-        rows.map((r) => (
-          <div key={r.policy_id} style={{ borderTop: '1px solid var(--line)', paddingTop: 10, marginTop: 10 }}>
-            <div className="row">
-              <b>{r.type_label}</b>
-              <span className="tag">{r.object_id}</span>
-              {r.decision_id != null && <span className="tag">来自决策 #{r.decision_id}</span>}
-            </div>
-            {r.evidence_text && (
-              <div className="small muted" style={{ margin: '6px 0' }}>
-                {r.evidence_text}
-              </div>
-            )}
-            <div className="small muted">来源 {r.source}</div>
-            <div className="row" style={{ marginTop: 8 }}>
-              <button className="btn primary" disabled={busy === r.policy_id} onClick={() => act(r.policy_id, 'activate')}>
-                认领（以后按这个来）
-              </button>
-              <button className="btn" disabled={busy === r.policy_id} onClick={() => act(r.policy_id, 'reject')}>
-                驳回
-              </button>
-            </div>
-          </div>
-        ))}
-      {msg && <div className="note" style={{ marginTop: 8 }}>{msg}</div>}
-    </div>
-  )
-}
-
 function ObjectionsCard() {
   // 排序是给人换视角用的：'recent' 看 agent 最近在担心什么，
   // 'due' 看「这几天该判的判了没」。表里 35 条有 26 条没写兑现日，
@@ -496,8 +406,8 @@ function EvalsCard() {
         </table>
       )}
       {data && data.by_agent.length > 0 && (
-        <div className="note">
-          命中率 = 对 /（对 + 错）；「无法判定」和「待验」不进分母 —— 分母为 0 时显示「暂无到期断言」，不拿 0% 充数。
+        <div className="small muted" style={{ marginTop: 8 }}>
+          命中率 = 对 /（对 + 错），不含无法判定与待验。
         </div>
       )}
     </div>
@@ -512,7 +422,7 @@ function AssumptionsCard() {
     <div className="card">
       <h2>
         待复核假设
-        <span className="sub">agent 跳过没问、先按默认动作走的建议，到期要人回头看</span>
+        <span className="sub">跳过默认执行的建议，到期复核</span>
       </h2>
       {err && <div className="err">读不到假设记录：{err}</div>}
       {!err && !data && <div className="note">读取中…</div>}
@@ -523,8 +433,8 @@ function AssumptionsCard() {
         <table>
           <thead>
             <tr>
-              <th>object_id</th>
-              <th>question_code</th>
+              <th>对象</th>
+              <th>问题代码</th>
               <th>默认动作</th>
               <th>复核日</th>
             </tr>
@@ -553,20 +463,23 @@ export default function AgentPanel({ signal }: { signal?: number }) {
       <div className="card tight">
         <h2>
           Agent 账本
-          <span className="sub">这是「agent 说的话后来对不对」的账本，不是投放操作面板</span>
+          <span className="sub">自动诊断运行、反对复盘与策略认领台账（不直接改动投放）</span>
         </h2>
-        <div className="note">
-          每次 agent 运行都会留下断言（agent_eval）和反对（agent_objection）。到期后由核对流程判对错，
-          这里只读展示：跑了什么、反对了什么、兑现了多少、还有哪些假设等人回头看。
-          这个页面改不了任何投放。
-        </div>
         <SummaryStrip />
       </div>
-      <PolicyCard signal={signal} />
-      <RunsCard />
+      <PolicyList signal={signal} />
       <ObjectionsCard />
-      <EvalsCard />
       <AssumptionsCard />
+      <details className="disclosure">
+        <summary>
+          系统运行与准确率明细（默认收起）
+          <span className="disclosure-sub">最近运行记录（模型 / tokens）· 各 Agent 断言命中率</span>
+        </summary>
+        <div className="drawer-box">
+          <RunsCard />
+          <EvalsCard />
+        </div>
+      </details>
     </div>
   )
 }

@@ -10,14 +10,21 @@ type Bubble = {
   meta?: string
 }
 
+const STARTER_QUESTIONS = [
+  '今天为什么没有直接执行的调价建议？',
+  '最近花了钱但没出单的词有哪些？',
+  '上周批过的调价现在效果怎么样？',
+  '目前最需要我人工拍板的问题是什么？',
+]
+
 /** 把库里的一轮转成气泡。溯源压成一行小字 —— 答案本身之外，「它凭什么这么说」才是要留的东西。 */
 function toBubble(t: ChatTurn): Bubble {
   const bits: string[] = []
   if (t.cite?.run_id) bits.push(`奏折 #${t.cite.run_id}`)
   if (t.cite?.cited_decision_ids?.length) {
-    bits.push(`decision_id=${t.cite.cited_decision_ids.join(',')}`)
+    bits.push(`决策 #${t.cite.cited_decision_ids.join(',')}`)
   }
-  if (t.cite?.null_decision) bits.push('含「没落库」那条')
+  if (t.cite?.null_decision) bits.push('含未入账条目')
   return {
     key: `h-${t.turn_id}`,
     role: t.role === 'user' ? 'user' : 'assistant',
@@ -27,10 +34,9 @@ function toBubble(t: ChatTurn): Bubble {
 }
 
 /**
- * 对话页。
+ * 对话页（问账）。
  *
- * 这里只负责「把话递出去、把回答摆出来」，不解释事实 —— 每条结论都得能指回奏折或
- * decision_id，指不回去的回答要在小字里露出来（没有锚点 = 回看时该打折扣）。
+ * 只基于广告数据与决策台账作答，回答下方标注对应奏折与决策出处。
  */
 export default function Chat() {
   const [bubbles, setBubbles] = useState<Bubble[]>([])
@@ -50,7 +56,7 @@ export default function Chat() {
         if (alive) setBubbles(r.turns.map(toBubble))
       })
       .catch((e) => {
-        if (alive) setNote(`历史没读到：${e instanceof Error ? e.message : String(e)}`)
+        if (alive) setNote(`历史记录读取失败：${e instanceof Error ? e.message : String(e)}`)
       })
       .finally(() => {
         if (alive) setLoaded(true)
@@ -76,10 +82,10 @@ export default function Chat() {
     return () => window.clearInterval(id)
   }, [busy])
 
-  async function send() {
-    const text = draft.trim()
+  async function send(textOverride?: string) {
+    const text = (textOverride ?? draft).trim()
     if (!text || busy) return
-    setDraft('')
+    if (textOverride === undefined) setDraft('')
     setNote(null)
     setBubbles((b) => [...b, { key: `u-${Date.now()}`, role: 'user', text }])
     setBusy(true)
@@ -88,17 +94,15 @@ export default function Chat() {
     try {
       const r = await sayChat({ text, as_of: asOf.trim() || null })
       const meta = [
-        r.model ?? '模型不明',
         `${(r.elapsed_ms / 1000).toFixed(1)}s`,
-        r.tokens ? `tokens ${r.tokens.in}/${r.tokens.out}` : null,
         r.business_day ? `奏折 ${r.business_day}` : null,
-        r.cited_decision_ids?.length ? `decision_id=${r.cited_decision_ids.join(',')}` : null,
+        r.cited_decision_ids?.length ? `决策 #${r.cited_decision_ids.join(',')}` : null,
       ]
         .filter(Boolean)
         .join(' · ')
       setBubbles((b) => [...b, { key: `a-${Date.now()}`, role: 'assistant', text: r.reply, meta }])
       // 回答是真的、只是没落库：话照给，但要明说这回看时查不到它。
-      if (!r.ok) setNote(r.warning ?? '这轮回答没写进台账，事后回看看不到它。')
+      if (!r.ok) setNote(r.warning ?? '本轮回答未写入台账，刷新后可能无法回看。')
     } catch (e) {
       setBubbles((b) => [
         ...b,
@@ -126,23 +130,20 @@ export default function Chat() {
       <div className="card chat-panel">
         <h2>
           问账
-          <span className="sub">
-            答案只用库里的事实拼；指不到奏折或 decision_id 的，气泡下面那行会是空的
-          </span>
+          <span className="sub">基于数据与决策台账作答，回答下方标注出处</span>
         </h2>
 
         <div className="chat-box" ref={scroller}>
-          {!loaded && <div className="muted small">正在读历史……</div>}
+          {!loaded && <div className="muted small">正在读取历史对话…</div>}
           {loaded && bubbles.length === 0 && (
             <div className="chat-empty muted small">
-              还没有对话。可以这样问：「今天为什么降 lat pulldown 的价」「上周那条判断后来对了吗」
-              「这个词的钱花在哪了」。一轮要十几到上百秒，发送后会有秒数在走。
+              还没有对话。点击下方快捷问题可直接发问，或在输入框自由提问。
             </div>
           )}
           {bubbles.map((b) => (
             <div key={b.key} className={`bubble ${b.role}`}>
               <div className="who">
-                {b.role === 'user' ? '你' : b.role === 'assistant' ? 'agent' : '出错'}
+                {b.role === 'user' ? '你' : b.role === 'assistant' ? '助手' : '出错'}
               </div>
               <div className="body">
                 <Rich text={b.text} />
@@ -152,9 +153,9 @@ export default function Chat() {
           ))}
           {busy && (
             <div className="bubble assistant">
-              <div className="who">agent</div>
+              <div className="who">助手</div>
               <div className="body chat-wait">
-                正在翻库并回答…… 已等 {waited} 秒
+                正在检索数据并整理回答… 已等 {waited} 秒
               </div>
             </div>
           )}
@@ -162,20 +163,34 @@ export default function Chat() {
 
         {note && <div className="warn small">{note}</div>}
 
+        <div className="pill-row" aria-label="快捷问题">
+          {STARTER_QUESTIONS.map((q) => (
+            <button
+              key={q}
+              type="button"
+              className="pill-btn"
+              disabled={busy}
+              onClick={() => void send(q)}
+            >
+              {q}
+            </button>
+          ))}
+        </div>
+
         <div className="chat-input">
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="问一句。Enter 发送，Shift+Enter 换行"
-            rows={3}
+            placeholder="输入问题，Enter 发送，Shift+Enter 换行"
+            rows={2}
           />
           <div className="row">
             <input
               type="text"
               value={asOf}
               onChange={(e) => setAsOf(e.target.value)}
-              placeholder="用哪天的奏折（YYYY-MM-DD，留空=最新）"
+              placeholder="指定复盘日期（YYYY-MM-DD，留空看最新）"
             />
             <button className="btn primary" disabled={busy || !draft.trim()} onClick={() => void send()}>
               {busy ? `发送中 ${waited}s` : '发送'}

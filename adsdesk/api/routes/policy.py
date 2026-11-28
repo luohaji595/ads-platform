@@ -128,9 +128,35 @@ def pending():
     }
 
 
+def split_by_expiry(rows, today: str) -> tuple[list[dict], list[dict]]:
+    """把 status='active' 的行拆成（还在生效，已过期）。
+
+    口径必须和引擎一致，否则人会照着一条引擎已经不执行的规矩做决定。
+    2026-11-26 实测：把 policy_id=8 的 expires_at 改成 2020-01-01 后，
+    engine 的 `_policy_rows` 返回 [1,2,3,4,6,7]（不含 8），而工作台返回 8 条 ——
+    人看到「当前规矩」里有 8，引擎根本不认它。
+    引擎那边是 `engine/reason_routes.py:_policy_rows` 的
+    `and (expires_at is null or expires_at >= ?)`（按日比）。
+
+    空 expires_at = 永久有效（agent 生成的策略从不带 expires_at，
+    见 `attribute.py:_policy_proposal` 的 INSERT 列表）。
+    """
+    items, expired = [], []
+    for r in rows:
+        exp = (r["expires_at"] or "").strip()
+        (expired if exp and exp[:10] < today else items).append(_row(r))
+    return items, expired
+
+
 @router.get("/active")
 def active():
-    """已生效：engine 下次跑就会按这些规矩行事。给 AgentPanel 做「当前规矩」清单。"""
+    """已生效：engine 下次跑就会按这些规矩行事。给 AgentPanel 做「当前规矩」清单。
+
+    过期的不隐藏而是单独列出来：藏起来会让人以为「这条规矩消失了」，
+    实际是「还在库里、只是不再执行」，两者的处置完全不同
+    （前者不用管，后者得决定要不要续期或删掉）。
+    """
+    today = datetime.now(CST).date().isoformat()
     with read_conn() as conn:
         rows = conn.execute(
             """select policy_id, scope, object_id, policy_type, params_json, source,
@@ -138,9 +164,14 @@ def active():
                from policy where status='active'
                order by reviewed_at desc, policy_id desc"""
         ).fetchall()
-    items = [_row(r) for r in rows]
-    return {"policies": items,
-            "note": None if items else "策略库还没有生效条目，引擎仍按规则硬阈值判断。"}
+    items, expired = split_by_expiry(rows, today)
+    return {
+        "policies": items,
+        "expired": expired,
+        "note": None if items else (
+            "策略库没有生效中的条目，引擎仍按规则硬阈值判断。"
+            + (f"（另有 {len(expired)} 条已过期，见下）" if expired else "")),
+    }
 
 
 class ActivateIn(BaseModel):

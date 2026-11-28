@@ -1,7 +1,8 @@
 """P1 端到端自测：打钩 → 生成执行单 → 标已改 → 归因窗 → 答题，全链路走一遍。
 
 真实顺序是「打钩 → 生成执行单 → 改后台 → 标已改」，脚本按这个顺序走。
-只碰 test 专用的行，跑完自己删干净。真实数据一行不改。
+整个流程跑在临时库副本上（sqlite backup API 拷出来 + 自己起一个只指向副本的
+uvicorn），跑完连副本一起删掉；生产库全程只被只读打开一次，真实数据一行不改。
 用法：python3 adsdesk/api/selftest.py
 """
 from __future__ import annotations
@@ -24,9 +25,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parents[1]))
 
-from api.db import DB_PATH, connect  # noqa: E402
+from api.db import DB_PATH  # noqa: E402
 from agents.attribute import days_for  # noqa: E402
 
+# 指向哪个服务由 main() 里按副本端口覆盖，这里只是占位
 BASE = "http://127.0.0.1:5273/api"
 MARK = "SELFTEST_P1"
 
@@ -68,9 +70,22 @@ def msg(r: dict) -> str:
 
 
 def main() -> int:
-    conn = connect()
+    global BASE
     ok = 0
     bad = 0
+
+    # ---------- 全程跑在临时副本上 ----------
+    # 原写法是 conn = connect() 直连生产库、BASE 指向 5273 上那个同样连着生产库的
+    # 常驻服务，finally 里再按 object_id 前缀物理删除 5 张沉淀表 —— 前缀一旦和真实
+    # 对象撞上就是删真数据（生产库现在恰好 0 行，纯属运气）。
+    # 现在 backup 一份副本、自己起一个只指向副本的服务，自测的读写全落副本上，
+    # 跑完连副本一起删掉，生产库只被只读打开一次。
+    _tmpdir = Path(tempfile.mkdtemp(prefix="adsdesk-selftest-"))
+    _tmpdb = _tmpdir / "ads.sqlite3"
+    _logf = None
+    conn = None
+    _proc = None
+    did = None
 
     def check(name: str, cond: bool, detail: str = "") -> None:
         nonlocal ok, bad
@@ -114,45 +129,12 @@ def main() -> int:
         check("未知 action_type 落到默认 7 天", days_for("no_such_action") == 7,
               str(days_for("no_such_action")))
 
-        tmpdir = Path(tempfile.mkdtemp(prefix="adsdesk-selftest-"))
-        tmpdb = tmpdir / "ads.sqlite3"
-        src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-        dst = sqlite3.connect(tmpdb)
+        # 副本与服务由 main() 统一建好（main 已校验 /health 指向副本库），
+        # 这一节直接复用 —— 早先这里又 backup 一次、又起一个服务，同一份副本
+        # 开两套连接、收尾也要收两遍。
+        copy = conn
+        base = BASE
         try:
-            src.backup(dst)
-        finally:
-            src.close()
-            dst.close()
-        copy = sqlite3.connect(tmpdb)
-        copy.row_factory = sqlite3.Row
-        port = _free_port()
-        base = f"http://127.0.0.1:{port}/api"
-        log = open(tmpdir / "uvicorn.log", "w")
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "main:app",
-             "--host", "127.0.0.1", "--port", str(port)],
-            cwd=str(HERE), env={**os.environ, "ADS_DB": str(tmpdb)},
-            stdout=log, stderr=subprocess.STDOUT,
-        )
-        try:
-            up = False
-            for _ in range(160):
-                time.sleep(0.25)
-                try:
-                    st, h = call_on(base, "/health")
-                    # 光端口通不够：必须确认它读的就是副本，否则后面全打在生产库上
-                    if st == 200 and Path(h.get("db") or "") == tmpdb:
-                        up = True
-                        break
-                except Exception:  # noqa: BLE001 - 起服务期间连不上是常态
-                    pass
-            check("副本实例起来了且指向副本库", up, f"port={port}")
-            if not up:
-                # 起不来时把服务的 stderr 打出来，否则只看到「port=xxx」没法查
-                log.flush()
-                print("  —— uvicorn 日志尾 ——")
-                print((tmpdir / "uvicorn.log").read_text()[-800:])
-                return
 
             # 夹具直接写副本：两条同活动 + 一条无活动归属。
             # 用三种不同的 action_type，是为了让归因窗分别落到 7/14/14 天。
@@ -307,37 +289,77 @@ def main() -> int:
             check("留空时自动发新号（不与已有单同号）",
                   st == 200 and det(r).get("ticket_id") != ticket, msg(r))
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
-            log.close()
-            copy.close()
-            # 副本整个删掉：不留 .sqlite3-wal/-shm，也不让 /tmp 攒垃圾
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    # ---------- 造一条可审批的测试建议 ----------
-    conn.execute(
-        """insert into decision_log
-           (run_id, rule_id, rule_version, entity_type, entity_id, entity_label,
-            campaign_id, action_type, confidence, current_value, proposed_value,
-            spend_impact, status, rationale, decided_at,
-            context_json, calculation_json, significance_json)
-           values (10,'R01','1.0','keyword','selftest-kw','selftest 词',
-                   '175723193023274','reduce_bid','high','$1.00','$0.80',
-                   -12.5,'proposed',?,?,'{}','[]','{}')""",
-        (MARK, "2026-11-17T00:00:00Z"),
-    )
-    conn.commit()
-    did = conn.execute(
-        "select decision_id from decision_log where rationale=? order by decision_id desc limit 1",
-        (MARK,),
-    ).fetchone()["decision_id"]
-    print(f"[测试行] decision_id={did}")
+            # 服务与副本的收尾归 main()：这里不再 terminate/close/rmtree，
+            # 否则 main 后面还要用 conn 和副本，会踩到已关闭的连接。
+            pass
 
     try:
+        _logf = open(_tmpdir / "uvicorn.log", "w")
+        _src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        _dst = None
+        try:
+            _dst = sqlite3.connect(_tmpdb)
+            # 必须用 backup API：生产库开着 WAL，直接 cp 主文件会丢 WAL 里没 checkpoint 的行
+            _src.backup(_dst)
+        finally:
+            if _dst is not None:
+                _dst.close()
+            _src.close()
+        conn = sqlite3.connect(_tmpdb)
+        conn.row_factory = sqlite3.Row
+        _port = _free_port()
+        BASE = f"http://127.0.0.1:{_port}/api"
+        _proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "main:app",
+             "--host", "127.0.0.1", "--port", str(_port)],
+            cwd=str(HERE),
+            env={**os.environ, "ADS_DB": str(_tmpdb)},
+            stdout=_logf,
+            stderr=subprocess.STDOUT,
+        )
+        _deadline = time.time() + 30
+        while True:
+            if _proc.poll() is not None:
+                _logf.flush()
+                print((_tmpdir / "uvicorn.log").read_text()[-800:])
+                raise SystemExit(
+                    f"副本实例提前退出（code={_proc.returncode}），日志见 {_tmpdir}/uvicorn.log"
+                )
+            if time.time() > _deadline:
+                _proc.kill()
+                _proc.wait()
+                _logf.flush()
+                print((_tmpdir / "uvicorn.log").read_text()[-800:])
+                raise SystemExit(f"副本实例 30s 没起来，日志见 {_tmpdir}/uvicorn.log")
+            try:
+                _h = call_on(BASE, "/health")[1]
+            except Exception:  # noqa: BLE001 - 起服务期间连不上是常态
+                time.sleep(0.3)
+                continue
+            # 光端口通不够：必须确认它读的就是副本，否则后面全打在生产库上
+            if Path(_h.get("db") or "") == _tmpdb:
+                break
+            time.sleep(0.3)
+
+        # ---------- 造一条可审批的测试建议 ----------
+        conn.execute(
+            """insert into decision_log
+               (run_id, rule_id, rule_version, entity_type, entity_id, entity_label,
+                campaign_id, action_type, confidence, current_value, proposed_value,
+                spend_impact, status, rationale, decided_at,
+                context_json, calculation_json, significance_json)
+               values (10,'R01','1.0','keyword','selftest-kw','selftest 词',
+                       '175723193023274','reduce_bid','high','$1.00','$0.80',
+                       -12.5,'proposed',?,?,'{}','[]','{}')""",
+            (MARK, "2026-11-17T00:00:00Z"),
+        )
+        conn.commit()
+        did = conn.execute(
+            "select decision_id from decision_log where rationale=? order by decision_id desc limit 1",
+            (MARK,),
+        ).fetchone()["decision_id"]
+        print(f"[测试行] decision_id={did}")
+
         print("\n1) 审批：批这条")
         st, r = call("/approve/decision", {"decision_id": did, "status": "approved"})
         check("200", st == 200, msg(r))
@@ -484,62 +506,84 @@ def main() -> int:
         })
         check("404", st == 404, msg(r))
 
-        # 最后一段跑在副本上，所以它不会碰 conn（conn 指生产库）。
+        # 最后一段（执行单闭环）用的是同一个副本连接 conn，只是走另一套服务端口，
+        # 所以它落下的 executed 决策不会进生产库。
         exec_chain()
 
     finally:
-        conn.execute("delete from exec_order_item where decision_id=?", (did,))
-        conn.execute("delete from exec_order_item where order_id in "
-                     "(select order_id from exec_order where note=?)", (MARK,))
-        # ticket 必须在删 exec_order 之前清：它靠 exec_order.ticket_id 定位，
-        # 顺序反了就只能按 ticket_id 猜，而自测每次发的号都不一样。
-        conn.execute("delete from ticket where ticket_id in "
-                     "(select ticket_id from exec_order where note=?)", (MARK,))
-        conn.execute("delete from exec_order where note=?", (MARK,))
-        conn.execute("delete from reason_hit where evidence_text like ?", (f"%{MARK}%",))
-        conn.execute("delete from agent_assumption where object_id = ?", ("账户目标-skip",))
-        # S3 之后打钩会写沉淀表；自测的行也必须删掉，否则真库里会留下
-        # 一条「账户目标」的 active policy，下一轮真实判断会照它走。
-        for _t, _col in (("policy", "policy_type"), ("param_override", "param_key"),
-                         ("observation_task", "reason_code"), ("experiment", "reason_code"),
-                         ("reason_excluded", "reason_code")):
-            conn.execute(f"delete from {_t} where object_id like '账户目标%'")
-        conn.execute("delete from decision_log where rationale=?", (MARK,))
-        conn.commit()
-        left = conn.execute(
-            "select count(*) c from decision_log where rationale=?", (MARK,)
-        ).fetchone()["c"]
-        residue = {
-            "decision_log": left,
-            "exec_order": conn.execute(
-                "select count(*) c from exec_order where note=?", (MARK,)
-            ).fetchone()["c"],
-            "exec_order_item": conn.execute(
-                "select count(*) c from exec_order_item where decision_id not in "
-                "(select decision_id from decision_log)"
-            ).fetchone()["c"],
-            # ticket 曾经不在清理和体检里，于是每跑一次自测就往真库留一张
-            # 「selftest 词 $1.00→$0.80」的假单 —— 体检项漏了，污染就一直看不见。
-            "ticket": conn.execute(
-                "select count(*) c from ticket where summary like '%selftest%'"
-            ).fetchone()["c"],
-            "reason_hit": conn.execute(
-                "select count(*) c from reason_hit where evidence_text like ?", (f"%{MARK}%",)
-            ).fetchone()["c"],
-            "agent_assumption": conn.execute(
-                "select count(*) c from agent_assumption where object_id like '%selftest%'"
-            ).fetchone()["c"],
-            "sediment": conn.execute(
-                "select (select count(*) from policy where object_id like '账户目标%')"
-                " + (select count(*) from param_override where object_id like '账户目标%')"
-                " + (select count(*) from observation_task where object_id like '账户目标%')"
-                " + (select count(*) from experiment where object_id like '账户目标%')"
-                " + (select count(*) from reason_excluded where object_id like '账户目标%') c"
-            ).fetchone()["c"],
-        }
-        conn.commit()
-        print(f"\n[清理] {residue}")
-        conn.close()
+        try:
+            if conn is not None:
+                try:
+                    if did is not None:
+                        conn.execute("delete from exec_order_item where decision_id=?", (did,))
+                    conn.execute("delete from exec_order_item where order_id in "
+                                 "(select order_id from exec_order where note=?)", (MARK,))
+                    # ticket 必须在删 exec_order 之前清：它靠 exec_order.ticket_id 定位，
+                    # 顺序反了就只能按 ticket_id 猜，而自测每次发的号都不一样。
+                    conn.execute("delete from ticket where ticket_id in "
+                                 "(select ticket_id from exec_order where note=?)", (MARK,))
+                    conn.execute("delete from exec_order where note=?", (MARK,))
+                    conn.execute("delete from reason_hit where evidence_text like ?", (f"%{MARK}%",))
+                    conn.execute("delete from agent_assumption where object_id = ?", ("账户目标-skip",))
+                    # S3 之后打钩会写沉淀表；自测的行也必须删掉，否则真库里会留下
+                    # 一条「账户目标」的 active policy，下一轮真实判断会照它走。
+                    for _t, _col in (("policy", "policy_type"), ("param_override", "param_key"),
+                                     ("observation_task", "reason_code"), ("experiment", "reason_code"),
+                                     ("reason_excluded", "reason_code")):
+                        conn.execute(f"delete from {_t} where object_id like '账户目标%'")
+                    conn.execute("delete from decision_log where rationale=?", (MARK,))
+                    conn.commit()
+                    left = conn.execute(
+                        "select count(*) c from decision_log where rationale=?", (MARK,)
+                    ).fetchone()["c"]
+                    residue = {
+                        "decision_log": left,
+                        "exec_order": conn.execute(
+                            "select count(*) c from exec_order where note=?", (MARK,)
+                        ).fetchone()["c"],
+                        "exec_order_item": conn.execute(
+                            "select count(*) c from exec_order_item where decision_id not in "
+                            "(select decision_id from decision_log)"
+                        ).fetchone()["c"],
+                        # ticket 曾经不在清理和体检里，于是每跑一次自测就往真库留一张
+                        # 「selftest 词 $1.00→$0.80」的假单 —— 体检项漏了，污染就一直看不见。
+                        "ticket": conn.execute(
+                            "select count(*) c from ticket where summary like '%selftest%'"
+                        ).fetchone()["c"],
+                        "reason_hit": conn.execute(
+                            "select count(*) c from reason_hit where evidence_text like ?", (f"%{MARK}%",)
+                        ).fetchone()["c"],
+                        "agent_assumption": conn.execute(
+                            "select count(*) c from agent_assumption where object_id like '%selftest%'"
+                        ).fetchone()["c"],
+                        "sediment": conn.execute(
+                            "select (select count(*) from policy where object_id like '账户目标%')"
+                            " + (select count(*) from param_override where object_id like '账户目标%')"
+                            " + (select count(*) from observation_task where object_id like '账户目标%')"
+                            " + (select count(*) from experiment where object_id like '账户目标%')"
+                            " + (select count(*) from reason_excluded where object_id like '账户目标%') c"
+                        ).fetchone()["c"],
+                    }
+                    conn.commit()
+                    print(f"\n[清理] {residue}")
+                finally:
+                    conn.close()
+        finally:
+            try:
+                if _proc is not None and _proc.poll() is None:
+                    _proc.terminate()
+                    try:
+                        _proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        _proc.kill()
+                        _proc.wait()
+            finally:
+                try:
+                    if _logf is not None:
+                        _logf.close()
+                finally:
+                    shutil.rmtree(_tmpdir, ignore_errors=True)
+                    print(f"[副本] 已删除 {_tmpdir}")
 
     print(f"\n== {ok} 通过 / {bad} 失败 ==")
     return 0 if bad == 0 else 1

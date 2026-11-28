@@ -43,6 +43,10 @@ _ENGINE = str(Path(__file__).resolve().parents[3] / "engine")
 if _ENGINE not in sys.path:
     sys.path.insert(0, _ENGINE)
 import reason_routes  # noqa: E402
+# 冷却期长度只在 engine/rules.py 定义一次。这里导入而不本地重写 ——
+# 写侧（提案）与回写侧（执行）各写一份 72 就会漂，而它决定「同一个词多久内
+# 不许再改」，漂了就等于频控形同虚设。
+from rules import COOLDOWN_HOURS_BID  # noqa: E402
 
 
 def _now() -> datetime:
@@ -62,7 +66,8 @@ def _fetch_decision(conn, decision_id: int) -> dict:
         """select decision_id, run_id, rule_id, action_type, entity_type, entity_id,
                   entity_label, campaign_id, current_value, proposed_value,
                   status, confidence, spend_impact, rationale, ticket_id,
-                  gate_reason, override_by, override_reason, overridden_at
+                  gate_reason, override_by, override_reason, overridden_at,
+                  cooldown_until
            from decision_log where decision_id=?""", (decision_id,)
     ).fetchone()
     if not row:
@@ -159,14 +164,22 @@ def mark_executed(body: ExecutedIn):
                 409, f"#{body.decision_id} 当前状态 {d['status']}，只有已批的才能标已改")
         days = body.attribution_days or days_for(d["action_type"])
         now = _now()
-        update_decision(
-            conn, body.decision_id,
+        # 冷却期必须从**执行时刻**重算，不能沿用提案时写的那个值。
+        # 提案可能是 3 天前提的，它写的 cooldown_until 早就过去了 ——
+        # 直接沿用等于「刚改完就解除冷却」，频控白设。
+        # 只对本来就带冷却的动作类型重算（rules 在提案行上写了 cooldown_until
+        # 就是「这类动作受频控管」的标记）：bid 变更、卡位加价、预算调整。
+        _cd = d["cooldown_until"]
+        patch = dict(
             status="executed",
             executed_at=_iso(now),
             executed_by=body.executed_by,
             executed_value=body.executed_value or d["proposed_value"],
             attribution_due_at=_iso(now + timedelta(days=days)),
         )
+        if _cd:
+            patch["cooldown_until"] = _iso(now + timedelta(hours=COOLDOWN_HOURS_BID))
+        update_decision(conn, body.decision_id, **patch)
         orders = _close_exec_items(conn, body.decision_id, _iso(now), body.executed_by)
     return Ok(detail={
         "decision_id": body.decision_id,
@@ -199,10 +212,32 @@ def answer_question(body: QuestionAnswerIn):
         if not row:
             raise HTTPException(404, f"run #{body.run_id} 的奏折不存在")
         pack = json.loads(row["pack_json"])
+        # 按 qkey 定位（奏折内唯一），老奏折没有 qkey 时回退到 id。
+        # 为什么不能只按 id：id 是题号，同一份奏折里会重复 ——
+        # Q08（账户级）与 Q01（词级）可以同时存在，而 id 只说明「第几类问题」，
+        # 不说明「问的是哪个对象」。只按 id 取第一条，会把给词打的钩写到账户上。
         q = next((x for x in (pack.get("questions") or [])
-                  if x.get("id") == body.question_id), None)
+                  if (x.get("qkey") or x.get("id")) == body.question_id), None)
+        if not q:
+            # 兼容：前端还没升级时仍可能只传 id。此时只有该 id 唯一才允许继续，
+            # 有多条同 id 就明确拒绝，绝不猜。
+            cands = [x for x in (pack.get("questions") or [])
+                     if x.get("id") == body.question_id]
+            if len(cands) == 1:
+                q = cands[0]
+            elif len(cands) > 1:
+                raise HTTPException(
+                    409,
+                    f"run #{body.run_id} 里有 {len(cands)} 道题都叫 {body.question_id}，"
+                    f"无法确定你打的是哪一道。请刷新页面后重试（新版会带 qkey）。",
+                )
         if not q:
             raise HTTPException(404, f"问题 {body.question_id} 不在 run #{body.run_id} 里")
+
+        # qkey（如 "Q01#2"）只用来在 pack.questions 里定位题目；落库表（agent_assumption.question_code、
+        # reason_hit.scope、policy.params_json）必须用裸题号 q["id"]（"Q01"），否则收敛器
+        # _REFUTE_ON 查不到、会误判 unverifiable。HTTP 回执仍回 body.question_id 保持契约。
+        qid = q.get("id") or body.question_id
 
         options = q.get("options") or []
         codes = q.get("reason_codes") or []
@@ -242,13 +277,13 @@ def answer_question(body: QuestionAnswerIn):
                 rc = reason_routes.apply_answer(
                     conn, code=p["reason_code"], object_id=target,
                     option=meta_of(p["option_index"]), free_text=body.free_text,
-                    question_id=body.question_id, run_id=body.run_id)
+                    question_id=qid, run_id=body.run_id)
                 sediment.append({"option_index": p["option_index"], **rc})
             # 2) 划掉 → reason_excluded：这个码在这个对象上静默 90 天
             for c in crossed:
                 rc = reason_routes.exclude(
                     conn, object_id=target, code=c["reason_code"],
-                    question_id=body.question_id)
+                    question_id=qid)
                 sediment.append({"option_index": c["option_index"], **rc})
 
         # 3) 原话留档。只有勾了/跳过的才进 reason_hit —— 划掉的不进，
@@ -258,7 +293,7 @@ def answer_question(body: QuestionAnswerIn):
                 """insert into reason_hit (object_id, reason_code, scope, evidence_text,
                                            created_at, answer_type, decision_id)
                    values (?,?,?,?,?,?,?)""",
-                (target, p["reason_code"], body.question_id,
+                (target, p["reason_code"], qid,
                  p["option_text"] + (f"｜{body.free_text}" if body.free_text else ""),
                  now, "skip" if body.skipped else "answer", None),
             )
@@ -266,7 +301,7 @@ def answer_question(body: QuestionAnswerIn):
         # 4) 整题跳过 → 登记假设 + 观察期，到期用数据验。未表态不写任何表。
         if body.skipped:
             sediment.append(reason_routes.assume(
-                conn, object_id=target, question_id=body.question_id))
+                conn, object_id=target, question_id=qid))
 
     return Ok(detail={
         "question_id": body.question_id,
@@ -401,19 +436,23 @@ def _upsert_ticket(conn, *, ticket_id: str, order_id: int, rows: list[dict],
     )
 
 
-@router.get("/exec-order/{order_id}")
-def get_exec_order(order_id: int):
-    with read_conn() as conn:
-        order = conn.execute(
-            "select * from exec_order where order_id=?", (order_id,)
-        ).fetchone()
-        if not order:
-            raise HTTPException(404, f"执行单 {order_id} 不存在")
-        items = conn.execute(
-            """select i.*, d.confidence, d.spend_impact, d.rationale
-               from exec_order_item i left join decision_log d using (decision_id)
-               where i.order_id=? order by i.item_id""", (order_id,)
-        ).fetchall()
+def _order_payload(conn, order_id: int) -> dict | None:
+    """把一张执行单装配成前端要的形状：order + items + 按活动分组。
+
+    抽成函数是因为两处要用：按 id 查（GET /exec-order/{id}）和查「手上那张还没做完的」
+    （GET /exec-order/latest）。两处若各写一遍，分组规则迟早会漂开 ——
+    而分组顺序就是人照着抄的顺序，漂开了会让人跳着改。
+    """
+    order = conn.execute(
+        "select * from exec_order where order_id=?", (order_id,)
+    ).fetchone()
+    if not order:
+        return None
+    items = conn.execute(
+        """select i.*, d.confidence, d.spend_impact, d.rationale
+           from exec_order_item i left join decision_log d using (decision_id)
+           where i.order_id=? order by i.item_id""", (order_id,)
+    ).fetchall()
     item_rows = [dict(r) for r in items]
     # 按活动分组：后台是按 campaign 一屏一屏改的，平铺列表切后台会来回跳。
     # 这里只加输出、不改 items 的形状（老读者照旧），分组按 item_id 首次出现排序，
@@ -431,7 +470,47 @@ def get_exec_order(order_id: int):
         g["item_ids"].append(it["item_id"])
         if it.get("executed_at"):
             g["executed"] += 1
-    return Ok(detail={"order": dict(order), "items": item_rows, "groups": groups})
+    return {"order": dict(order), "items": item_rows, "groups": groups}
+
+
+@router.get("/exec-order/latest")
+def latest_exec_order():
+    """手上那张还没做完的执行单 —— 刷新页面后靠它把进度接回来。
+
+    为什么需要这个接口：执行单原来是纯前端 state（`useState<any>(null)`），
+    生成之后一刷新就没了，进度条、分组、逐条「已改」按钮全部回到「还没有批的动作」，
+    人只能重新点一次「生成执行单」—— 而那条路径会被后端 409 拦住
+    （`#{did} 已经在执行单 {ticket_id} 里了，不要重复下单`），于是**点不动也看不到**。
+
+    只回「还有条目没标已改」的那一张：做完的单不该常驻右栏占位置。
+    一张都没有就回 null，前端照旧显示「还没有批的动作」。
+    """
+    with read_conn() as conn:
+        # coalesce(status,'') <> 'cancelled'：作废的单不该继续占着右栏。
+        # 现在全仓还没有写 cancelled 的代码路径（只有 done/partial），但「没做完」
+        # 和「已作废」在 SQL 里长得一模一样，不写这一句以后加作废功能就会立刻踩坑。
+        row = conn.execute(
+            """select o.order_id
+               from exec_order o
+               join exec_order_item i on i.order_id = o.order_id
+               where coalesce(o.status, '') <> 'cancelled'
+               group by o.order_id
+               having sum(i.executed_at is not null) < count(*)
+               order by o.order_id desc
+               limit 1"""
+        ).fetchone()
+        if not row:
+            return Ok(detail=None)
+        return Ok(detail=_order_payload(conn, row["order_id"]))
+
+
+@router.get("/exec-order/{order_id}")
+def get_exec_order(order_id: int):
+    with read_conn() as conn:
+        payload = _order_payload(conn, order_id)
+    if payload is None:
+        raise HTTPException(404, f"执行单 {order_id} 不存在")
+    return Ok(detail=payload)
 
 
 @router.get("/pending")

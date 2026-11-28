@@ -374,6 +374,44 @@ def _option_object(route: Route, option: dict | None, object_id: str) -> str:
 # 不做的话「只加 5%」会被原样存成 0.05，下次加预算反而是把预算砍掉 95%。
 _ADDITIVE = {"max_budget_step"}
 
+# 参数的可接受区间（闭区间）。写侧和读侧都要卡，因为写侧卡住的是「新写的」，
+# 读侧卡住的是「已经写进去的脏值」—— 库里现在就有历史行，光修写侧不够。
+PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+    "target_acos": (0.10, 0.80),      # 目标 ACOS 10%~80%：低于 10% 没人做得到，高于 80% 等于不设目标
+    "max_budget_step": (1.05, 1.50),  # 加预算步长 1.05x~1.50x：一次翻倍会把预算烧穿
+}
+
+# 「%」必须紧贴在数字后面才算比例。原来的 `if "%" in raw: return parse_number(raw)`
+# 是「句子里出现过 %，就把句子里第一个数字当比例」——
+# 实测「2 周后放到 40%」被读成 0.02（抓到的是那个 2），
+# 于是主人想放宽到 40%，系统把目标写成了 2%，第二天所有词都成了「亏钱词」。
+_PCT = re.compile(r"(-?\d+(?:\.\d+)?)\s*[%％]")
+_DEC = re.compile(r"(?<![\d.])(-?\d*\.\d+)(?![\d])")
+_POINT = re.compile(r"(-?\d+(?:\.\d+)?)\s*(?:个百分|百分|个)点")
+
+# 钱不是比例。2026-11-26 实测：主人写「CPA 到 $1.5 再说」—— 这是「别加预算」的
+# 意思，系统把它读成 max_budget_step=1.5（加 50%），而且 PARAM_BOUNDS 的上界
+# 恰好就是 1.5，clamp 拦不住，第二天 R08 真的把预算加了 50%。
+# 裸小数在中文里既能写比例也能写金额，所以必须先判「这句在说钱」。
+_MONEY_SYM = re.compile(r"[$¥€£￥]")
+_MONEY_WORD = re.compile(r"(美元|美金|刀|块钱|RMB|CNY|USD)", re.I)
+# 这些词一出现，句子里的小数就是「花了多少」而不是「调到多少」
+_MONEY_CTX = re.compile(r"(CPA|CPC|客单价|花费|成本|单均|花了|出价|bid)", re.I)
+
+
+def _money_context(text: str) -> bool:
+    """这句在说钱吗？
+
+    只影响「裸小数」这一条判据：带 % 或「个点」的数已经绑了单位，不管在说什么都是比例。
+    裸小数不行 —— 中文里 `1.5` 既可能是「目标 1.5 倍」，也可能是「CPA 1.5 美元」。
+
+    判据取「整句只要有钱的痕迹就算」，宁严不宽：
+    误判成比例会真的花错钱（下面注释里那条 1.5 就是），
+    误判成「不是比例」只会退回 pack 自带的默认值 —— 代价小得多。
+    """
+    return bool(_MONEY_SYM.search(text) or _MONEY_WORD.search(text)
+                or _MONEY_CTX.search(text))
+
 
 def _explicit_ratio(text: str | None) -> float | None:
     """人「明确写了比例」才采信手填数值：带 % 或写了小数（0.45）或「…个点」。
@@ -381,17 +419,56 @@ def _explicit_ratio(text: str | None) -> float | None:
     为什么不能见数就收：人话里的数字多数不是参数 ——「先查主图，2 周后再说」
     里的 2 会被 parse_number 读成 2%。宁可退回 pack 的默认值，也不能把
     「2 周」写成「目标 ACOS 2%」。
+
+    判据顺序（先精确后宽松，且**必须绑定单位**）：
+      1. `数字%`      —— 「放到 40%」→ 0.40（% 紧贴数字才算）
+      2. `数字 个点`  —— 「40 个点」→ 0.40
+      3. `0.45` 这种带小数点的裸数 —— 小数点在中文里几乎只用来写比例
+      都不中 → None。
+
+    裸小数这一条还要过一道「这句在不在说钱」（见 _money_context）：
+    2026-11-26 实测「CPA 到 $1.5 再说」被读成 max_budget_step=1.5，
+    而上界恰好是 1.5，clamp 拦不住，第二天 R08 真的把预算加了 50%。
+    主人那句话的意思是「别加」。
+
+    多个候选数同时出现时（「2 周后放到 40%」里 2 和 40 都算裸数字）：
+    只要有一个带单位的候选，就用带单位的那个；两个以上带单位的不同值 → 歧义，返回 None。
+    绝不「取第一个」—— 那正是原来出错的机制。
     """
     if not text:
         return None
-    raw = text.replace("％", "%")
-    if "%" in raw:
-        return parse_number(raw)
-    if re.search(r"(?<![\d.])\d*\.\d+(?![\d])", raw):
-        return parse_number(raw)
-    if "个点" in raw or "个百分点" in raw:
-        return parse_number(raw)
+    raw = str(text).replace("％", "%")
+
+    pct = [float(m) / 100.0 for m in _PCT.findall(raw)]
+    if pct:
+        return pct[0] if len(set(pct)) == 1 else None
+
+    pts = [float(m) / 100.0 for m in _POINT.findall(raw)]
+    if pts:
+        return pts[0] if len(set(pts)) == 1 else None
+
+    if _money_context(raw):
+        return None
+    dec = _DEC.findall(raw)
+    if dec:
+        vals = [float(d) for d in dec]
+        return vals[0] if len(set(vals)) == 1 else None
     return None
+
+
+def _clamp(key: str | None, value: float) -> float | None:
+    """把参数值夹进可接受区间；超出区间说明人写的不是这个意思，退回默认值。
+
+    为什么超界要退回而不是硬夹：写「放宽到 500%」的人想的显然不是
+    「ACOS 80%」，硬夹到 80% 等于把一句听不懂的话当成命令执行。
+    退回默认值（None）会让上层用 pack 自带的值，至少是系统算出来的合理数。
+    """
+    if not key or key not in PARAM_BOUNDS:
+        return value
+    lo, hi = PARAM_BOUNDS[key]
+    if value < lo or value > hi:
+        return None
+    return value
 
 
 def _value_for(route: Route, option: dict | None, free_text: str | None,
@@ -404,7 +481,9 @@ def _value_for(route: Route, option: dict | None, free_text: str | None,
     if n is not None:
         if key in _ADDITIVE and n < 1:
             n = round(1.0 + n, 4)
-        return str(n)
+        n = _clamp(key, n)
+        if n is not None:
+            return str(n)
     if option and option.get("param_value") not in (None, ""):
         return str(option["param_value"])
     return None

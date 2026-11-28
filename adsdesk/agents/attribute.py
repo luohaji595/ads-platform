@@ -103,6 +103,11 @@ ATTRIBUTION_DAYS = {
     "pause": 14,
     "floor_breach": 7,      # 计划书未列；地板价击穿是风控动作，按默认 7 天回看
     "observe": 7,           # 观察类：不改量，按默认窗口回看
+    # R31 卡位：加价与到位后降价，动的都是 bid，跟 reduce_bid/raise_bid 同口径。
+    # 原来这两条落在 DEFAULT_ATTRIBUTION_DAYS 上，值恰好也是 7，结果没错；
+    # 但「恰好对」和「写明了」是两件事 —— 默认值一改，卡位就会静默跟着变。
+    "rank_push": 7,
+    "rank_step_down": 7,
 }
 DEFAULT_ATTRIBUTION_DAYS = 7
 
@@ -225,6 +230,12 @@ _ENTITY_TABLE = {
     "search_term": ("fact_search_term_daily", "search_term"),
     "campaign": ("fact_campaign_daily", "campaign_id"),
     "placement": ("fact_placement_daily", "placement"),
+    # R09 出的对象是「活动::位置」这种复合 id（engine/rules.py 里
+    # entity_id=f"{cid}::{cp['placement']}"），不是单纯 placement。
+    # 早先这张表里没有这个键，_entity_stats 直接返回 unsupported_entity_type，
+    # 于是 R09 的每一条建议都永远归因不了（生产库 12 条 campaign_placement
+    # 决策全部 unsupported）。这里给它一条专用路径，见 _entity_stats。
+    "campaign_placement": ("fact_placement_daily", None),
 }
 
 
@@ -266,10 +277,22 @@ def _entity_stats(conn: sqlite3.Connection, entity_type: str, entity_id,
     if spec is None:
         return {"rows": 0, "unsupported_entity_type": entity_type}
     table, key = spec
-    sql = (f"select count(distinct report_date) rows, {_METRIC_COLS} "
-           f"from {table} where {key} = ? and report_date between ? and ?")
+    if key is None:
+        # campaign_placement：entity_id 形如 "campaign_id::placement"，
+        # 拆开按 (campaign_id, placement) 双条件过滤，不能整串丢进 where。
+        cid, _, place = str(entity_id).partition("::")
+        if not cid or not place:
+            return {"rows": 0, "bad_entity_id": entity_id}
+        sql = (f"select count(distinct report_date) rows, {_METRIC_COLS} "
+               f"from {table} where campaign_id = ? and placement = ? "
+               f"and report_date between ? and ?")
+        args: tuple = (cid, place, start, end)
+    else:
+        sql = (f"select count(distinct report_date) rows, {_METRIC_COLS} "
+               f"from {table} where {key} = ? and report_date between ? and ?")
+        args = (entity_id, start, end)
     try:
-        r = conn.execute(sql, (entity_id, start, end)).fetchone()
+        r = conn.execute(sql, args).fetchone()
     except sqlite3.Error as exc:              # 表/列不在（老库）
         return {"rows": 0, "error": str(exc)}
     if r is None or (r["clicks"] is None and r["cost"] is None
@@ -692,7 +715,17 @@ def _predicts(d: sqlite3.Row, payload: dict, now: datetime) -> list[dict]:
     # 兑现率会因为这个口径差假性归零。
     alpha = round(1.0 - facts.DEFAULT_CONFIDENCE, 2)
     spec = _ENTITY_TABLE.get((d["entity_type"] or "").lower())
-    table = spec[0] if spec else "fact_keyword_daily"
+    if spec is None:
+        # 不认识的对象类型就不写断言。
+        # 原来这里 `table = spec[0] if spec else "fact_keyword_daily"` —— 拿关键词表
+        # 的名字冒充。而 method 不是纯注释：converge 的 _parse_window / _parse_entities
+        # 都从这段文本里抽窗口和实体，写错表名等于让它按别的对象复算，
+        # 而且人读到的「依据：fact_keyword_daily」也是假的。
+        # 判不了就不判（保持 pending 等下一轮），比写一条指错地方的断言好。
+        print(f"  [归因] #{d['decision_id']} entity_type={d['entity_type']!r} "
+              f"不在 _ENTITY_TABLE 里，跳过断言（不猜表名）", flush=True)
+        return []
+    table = spec[0]
     return [{
         "claim": (f"#{d['decision_id']} 后窗 CVR 与账户基线 {p0:.2%} "
                   f"{'有' if significant else '无'}显著差异（本次判定 {payload['verdict']}）"),

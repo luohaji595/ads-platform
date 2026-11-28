@@ -72,7 +72,7 @@ FAIL_LOG = HERE / "data" / "rank_fail.log"
 
 # 复用探针的连接层。sys.path 而不是复制一份代码：SSE/代理那些坑只有一处需要维护。
 sys.path.insert(0, str(ROOT / "tools"))
-from sorftime_probe import DEFAULT_URL, rpc  # noqa: E402
+from sorftime_probe import default_url, rpc  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 
@@ -222,8 +222,9 @@ class Client:
         "common_usage_query": ("no data available", "no data"),
     }
 
-    def __init__(self, url: str = DEFAULT_URL, verbose: bool = False, pause: float = 1.5):
-        self.url = url
+    def __init__(self, url: str | None = None, verbose: bool = False, pause: float = 1.5):
+        # url=None 时延迟解析（环境变量 / ~/.config/sorftime/key / .env）。
+        self.url = url or default_url()
         self.verbose = verbose
         self.pause = pause      # 每次调用之间的间隔。sorftime 没有积加那种 1 分钟熔断，
         self.calls = 0          # 但也没必要狂刷；1.5s 足够把「批量」和「打点」区分开。

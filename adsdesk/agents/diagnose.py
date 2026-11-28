@@ -78,8 +78,10 @@ def validate(out: dict, inp: dict) -> tuple[dict, list[str]]:
             "id": qid, "object": q.get("object"), "ask": q.get("ask"),
             "options": [str(o) for o in opts],
             "reason_codes": [str(c) for c in codes],
-            "impact": _num(q.get("impact")),
-            "uncertainty": _num(q.get("uncertainty")),
+            # impact 是「这件事值多少钱」，一个月的广告花费量级；
+            # uncertainty 是置信区间宽度，天生 0~1。越界一律当没给。
+            "impact": _num(q.get("impact"), lo=0.0, hi=1e6),
+            "uncertainty": _num(q.get("uncertainty"), lo=0.0, hi=1.0),
             "predicts": preds,
         })
 
@@ -132,11 +134,28 @@ def _clean_predicts(preds, window_end: str, tag: str) -> tuple[list[dict], list[
     return keep, warns
 
 
-def _num(v):
+def _num(v, *, lo: float | None = None, hi: float | None = None):
+    """模型给的数字，越界就当它没给。
+
+    2026-11-26 核实：这里原来是裸 `float(v)`，而 `impact` 会一路进前端
+    `AgentCard.tsx` 的 `fmtMoney(q.impact)`（`$` + toFixed(2)，没有任何范围检查），
+    `uncertainty` 直接当 0~1 的置信度显示。模型写「影响 999999999」或
+    「不确定 42」都能原样上屏，而人看到的是一句像模像样的金额 ——
+    比空白更糟，因为它看起来是算出来的。
+
+    越界不钳位：钳到边界会造出一个「看起来能用」的假数字。
+    """
     try:
-        return float(v)
+        x = float(v)
     except (TypeError, ValueError):
         return None
+    if x != x or x in (float("inf"), float("-inf")):  # NaN / inf
+        return None
+    if lo is not None and x < lo:
+        return None
+    if hi is not None and x > hi:
+        return None
+    return x
 
 
 # ------------------------------------------------------------------ 落库
@@ -196,6 +215,13 @@ def _reap_stale(conn, minutes: int = STALE_RUN_MINUTES) -> int:
     判据只看墙钟，不看进程 —— 因为记录可能是别的机器/别的进程写的。代价是
     真跑超过 30 分钟的正常调用会被误标；但那已经是单模型硬截止（300s）的 6 倍、
     整条链路（两个模型各 300s）的 3 倍，属于该失败的情况。
+
+    ⚠ 必须带 job='diagnose'。agent_run 是四个 agent 共用的一张表
+    （job ∈ diagnose/attribute/converge/converse），早先这里不过滤，
+    diagnose 一启动就把同期还在跑的 attribute/converge 的 running 行
+    一并判死 —— 那些行会被改成 failed，它们自己跑完再 update 时
+    就变成「failed 的行被写 ok」，工作台看到的状态是错的，
+    而且 attribute 的 _reap_stale 只清自己（job=AGENT），补不回来。
     """
     cutoff = (datetime.now(CST) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
     cur = conn.execute(
@@ -203,7 +229,7 @@ def _reap_stale(conn, minutes: int = STALE_RUN_MINUTES) -> int:
               set status='failed',
                   finished_at=?,
                   error=coalesce(error, ?)
-            where status='running' and started_at < ?""",
+            where job='diagnose' and status='running' and started_at < ?""",
         (datetime.now(CST).isoformat(timespec="seconds"),
          f"stale: 超过 {minutes} 分钟仍未结束，判定为进程已死（可能是 kill 或休眠冻结）",
          cutoff),

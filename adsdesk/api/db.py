@@ -56,6 +56,10 @@ DECISION_WRITABLE_COLUMNS = frozenset({
     "reject_reason", "reject_reason_code",
     "executed_at", "executed_value", "executed_by",
     "attribution_due_at", "ticket_id",
+    # cooldown_until：提案时由 rules 写「这类动作受 72h 频控管」，
+    # 标「已改」时要按**执行时刻**重算一次（提案可能放了好几天才批，
+    # 沿用旧值等于刚改完就解除冷却）。它不影响建议内容本身，只是频控账本。
+    "cooldown_until",
     "override_by", "override_reason", "overridden_at",
     "outcome_7d_json", "outcome_14d_json", "outcome_filled_at",
 })

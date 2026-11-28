@@ -1,7 +1,4 @@
-/** 一条待批动作。三颗按钮的顺序是「批 → 不批 → 提交」，因为最常见的动作是批；
- *  「已改」只在 approved 之后才出现 —— 标已改会开始算归因窗，跳过审批直接标
- *  等于把「没批的动作」混进「改完的效果」里。
- */
+/** 一条待批动作：批 → 不批 → 提交；已批后可标「已改」。 */
 import type { Decision } from '../../lib/api'
 import { fmtMoney } from '../../lib/charts'
 import { Rich, attrProgress, evidenceLabel, showValue, type Mark } from './shared'
@@ -44,12 +41,6 @@ export function DecisionRow({
       <div className="small muted">
         <Rich text={d.rationale ?? ''} />
       </div>
-      {(d.rule_record || d.object_record) && (
-        <div className="small muted" style={{ marginTop: 4 }}>
-          {d.rule_record && <div>· {d.rule_record}</div>}
-          {d.object_record && <div>· {d.object_record}</div>}
-        </div>
-      )}
       {d.objections && d.objections.length > 0 && (
         <div className="warn" style={{ marginTop: 6 }}>
           agent 反对：{d.objections.map((o) => o.why).join('；')}
@@ -79,14 +70,14 @@ export function DecisionRow({
           </button>
         )}
         {d.status === 'executed' && (
-          <span className="tag ok" title="窗口满了还要等报表回传归因，那天才是真的能看结果">
+          <span className="tag ok" title="窗口满了还要等报表回传归因">
             已改 · {attrProgress(d) ?? '归因窗已开'}
           </span>
         )}
         {mark === 'reject' && (
           <input
             type="text"
-            placeholder="为什么不批（可选，会进 reason_hit）"
+            placeholder="为什么不批（可选）"
             value={id != null ? reason : ''}
             onChange={(e) => id != null && onReason(id, e.target.value)}
             style={{ flex: 1, minWidth: 200 }}

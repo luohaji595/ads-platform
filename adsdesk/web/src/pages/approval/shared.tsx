@@ -79,6 +79,15 @@ export function showValue(v: string | number | null | undefined): string {
 
 export type Mark = Record<string, 'approve' | 'reject'>
 
+/**
+ * 一道题的稳定定位键。`id` 只是题号（Q01/Q08…），同一份奏折里会重复 ——
+ * 拿 id 当 key 会让「给第 2 个词打的钩」覆盖掉「第 1 个词」，提交时后端
+ * 也只按 id 找第一条。老奏折没有 qkey，回退到 id（那时同号题确实只有一道）。
+ */
+export function qkeyOf(q: { id: string; qkey?: string }): string {
+  return q.qkey || q.id
+}
+
 export function gateText(d: Decision): string {
   if (d.gate_reason) return d.gate_reason
   const s = d.significance || {}

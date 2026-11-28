@@ -130,8 +130,16 @@ def main() -> None:
         "SELECT run_id, dataset, start_date, end_date, pages, rows_fetched, rows_upserted, status,"
         " IFNULL(note,'') note FROM run_log ORDER BY run_id DESC LIMIT 8"
     ):
+        # pages / rows_fetched / rows_upserted 都可能为 NULL ——
+        # market / rank 这类走别的采集器的数据集从来不写 pages，
+        # 原来直接 `{r['pages']:<3d}` 会抛
+        # `TypeError: unsupported format string passed to NoneType.__format__`，
+        # 于是第 5 节永远打不出来（前四节正常，最容易误判成「跑完了」）。
+        pages = r["pages"] if r["pages"] is not None else "-"
+        fetched = r["rows_fetched"] if r["rows_fetched"] is not None else "-"
+        written = r["rows_upserted"] if r["rows_upserted"] is not None else "-"
         print(f"  #{r['run_id']:<3d} {r['dataset']:11s} {r['start_date']}~{r['end_date']}"
-              f" pages={r['pages']:<3d} fetched={r['rows_fetched']:<6d} written={r['rows_upserted']:<6d}"
+              f" pages={pages!s:<3s} fetched={fetched!s:<6s} written={written!s:<6s}"
               f" {r['status']:8s} {r['note']}")
 
     conn.close()
